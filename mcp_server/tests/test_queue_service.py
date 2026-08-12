@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from src.services.queue_service import EpisodeQueueFullError, QueueService
+from services.queue_service import EpisodeQueueFullError, QueueService
 
 
 @pytest.mark.asyncio
