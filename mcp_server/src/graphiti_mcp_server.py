@@ -760,9 +760,15 @@ async def get_episodes(
         from graphiti_core.nodes import EpisodicNode
 
         if effective_group_ids:
-            episodes = await EpisodicNode.get_by_group_ids(
-                client.driver, effective_group_ids, limit=max_episodes
-            )
+            episodes = []
+            for effective_group_id in effective_group_ids:
+                scoped_driver = client.driver.clone(database=effective_group_id)
+                episodes.extend(
+                    await EpisodicNode.get_by_group_ids(
+                        scoped_driver, [effective_group_id], limit=max_episodes
+                    )
+                )
+            episodes = episodes[:max_episodes]
         else:
             # If no group IDs, we need to use a different approach
             # For now, return empty list when no group IDs specified

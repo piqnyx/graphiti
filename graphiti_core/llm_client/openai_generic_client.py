@@ -166,7 +166,10 @@ class OpenAIGenericClient(LLMClient):
                 raise EmptyResponseError('LLM returned an empty response')
             # Many OpenAI-compatible/local models wrap JSON in a ```json fence even under a
             # structured response_format; strip it before parsing.
-            return json.loads(self._strip_code_fences(result))
+            parsed = json.loads(self._strip_code_fences(result))
+            if response_model is not None:
+                return response_model.model_validate(parsed).model_dump()
+            return parsed
         except openai.RateLimitError as e:
             raise RateLimitError from e
         except Exception as e:
