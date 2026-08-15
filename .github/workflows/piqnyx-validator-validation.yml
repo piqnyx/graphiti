@@ -34,4 +34,4 @@ jobs:
         run: python -m ruff check tools/falkor_validate.py tests/tools/test_falkor_validate.py
 
       - name: Validator unit tests
-        run: python -m pytest -q tests/tools/test_falkor_validate.py
+        run: python -m pytest -q --confcutdir=tests/tools tests/tools/test_falkor_validate.py
