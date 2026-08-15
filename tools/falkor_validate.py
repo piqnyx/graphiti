@@ -10,8 +10,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 from falkordb import FalkorDB
 
@@ -152,12 +153,15 @@ def validate_chain(
         )
 
     for previous, current_episode in zip(ordered, ordered[1:], strict=False):
-        if previous.valid_at is not None and current_episode.valid_at is not None:
-            if str(previous.valid_at) > str(current_episode.valid_at):
-                report.warn(
-                    f'{saga.name}: valid_at decreases: {previous.name} ({previous.valid_at}) -> '
-                    f'{current_episode.name} ({current_episode.valid_at})'
-                )
+        if (
+            previous.valid_at is not None
+            and current_episode.valid_at is not None
+            and str(previous.valid_at) > str(current_episode.valid_at)
+        ):
+            report.warn(
+                f'{saga.name}: valid_at decreases: {previous.name} ({previous.valid_at}) -> '
+                f'{current_episode.name} ({current_episode.valid_at})'
+            )
 
     return ordered
 
