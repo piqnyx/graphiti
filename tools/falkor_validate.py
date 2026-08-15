@@ -143,7 +143,7 @@ def validate_chain(
         current = children[0] if len(children) == 1 else None
 
     if len(seen) != len(episodes):
-        missing = [by_uuid[uuid].name for uuid in episode_ids - seen]
+        missing = sorted(by_uuid[uuid].name for uuid in episode_ids - seen)
         report.fail(f'{saga.name}: chain traversal did not reach all episodes: {missing}')
 
     if ordered and ordered[-1].uuid != saga.last_episode_uuid:
@@ -151,7 +151,7 @@ def validate_chain(
             f'{saga.name}: traversed last episode {ordered[-1].name} does not match stored last_episode_uuid'
         )
 
-    for previous, current_episode in zip(ordered, ordered[1:]):
+    for previous, current_episode in zip(ordered, ordered[1:], strict=False):
         if previous.valid_at is not None and current_episode.valid_at is not None:
             if str(previous.valid_at) > str(current_episode.valid_at):
                 report.warn(
@@ -226,17 +226,22 @@ def rows(graph: Any, query: str, **params: Any) -> list[list[Any]]:
 
 
 def load_sagas(graph: Any, group_id: str, saga_name: str | None) -> list[Saga]:
-    result = rows(
-        graph,
+    if saga_name is None:
+        query = """
+            MATCH (s:Saga)
+            WHERE s.group_id = $group_id
+            RETURN s.uuid, s.name, s.group_id, s.first_episode_uuid, s.last_episode_uuid, s.created_at
+            ORDER BY s.created_at, s.name
         """
-        MATCH (s:Saga)
-        WHERE s.group_id = $group_id AND ($saga_name IS NULL OR s.name = $saga_name)
-        RETURN s.uuid, s.name, s.group_id, s.first_episode_uuid, s.last_episode_uuid, s.created_at
-        ORDER BY s.created_at, s.name
-        """,
-        group_id=group_id,
-        saga_name=saga_name,
-    )
+        result = rows(graph, query, group_id=group_id)
+    else:
+        query = """
+            MATCH (s:Saga)
+            WHERE s.group_id = $group_id AND s.name = $saga_name
+            RETURN s.uuid, s.name, s.group_id, s.first_episode_uuid, s.last_episode_uuid, s.created_at
+            ORDER BY s.created_at, s.name
+        """
+        result = rows(graph, query, group_id=group_id, saga_name=saga_name)
     return [Saga(*row) for row in result]
 
 
@@ -351,7 +356,16 @@ def main() -> int:
         return 2
 
     saga_name = args.saga.strip() if args.saga else None
-    expectations = [] if args.non_interactive else collect_expectations_interactive()
+    if not args.non_interactive and args.saga is None:
+        saga_name = input('Saga name (пусто = проверить все Saga структурно): ').strip() or None
+
+    if args.expected_count is not None and saga_name is None:
+        print('ERROR: --expected-count requires an exact --saga', file=sys.stderr)
+        return 2
+
+    expectations: list[SemanticExpectation] = []
+    if not args.non_interactive and saga_name is not None:
+        expectations = collect_expectations_interactive()
 
     try:
         db = connect()
@@ -360,10 +374,9 @@ def main() -> int:
         if not sagas:
             print(f'FAIL: no Saga nodes found for group={group_id!r} saga={saga_name!r}')
             return 1
-
-        if args.expected_count is not None and len(sagas) != 1:
-            print('ERROR: --expected-count requires exactly one selected Saga', file=sys.stderr)
-            return 2
+        if saga_name is not None and len(sagas) != 1:
+            print(f'FAIL: expected one exact Saga named {saga_name!r}, found {len(sagas)}')
+            return 1
 
         all_next = load_next_edges(graph)
         overall = Report()
