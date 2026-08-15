@@ -29,6 +29,11 @@ class FakeDriver:
         cloned.database = database
         return cloned
 
+    async def execute_query(self, _query, **kwargs):
+        assert kwargs["uuid"] == "saga-uuid"
+        assert kwargs["routing_"] == "r"
+        return ([{"episode_count": 6}], None, None)
+
 
 @pytest.mark.asyncio
 async def test_get_saga_uses_group_scoped_driver_and_returns_persisted_state(monkeypatch):
@@ -85,6 +90,7 @@ async def test_get_saga_uses_group_scoped_driver_and_returns_persisted_state(mon
     assert result["group_id"] == "main"
     assert result["first_episode_uuid"] == "ep-1"
     assert result["last_episode_uuid"] == "ep-6"
+    assert result["episode_count"] == 6
     assert result["summary"] == "summary"
 
 
