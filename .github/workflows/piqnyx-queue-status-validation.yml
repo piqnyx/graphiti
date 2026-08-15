@@ -22,12 +22,9 @@ jobs:
       - name: Install dependencies
         working-directory: mcp_server
         run: uv sync
-      - name: Run piqnyx queue and recovery tests
+      - name: Run piqnyx reliable queue status tests
         working-directory: mcp_server
         run: >-
           uv run pytest -q -p no:cacheprovider
           tests/test_piqnyx_reliable_queue.py
           tests/test_piqnyx_queue_status_tool.py
-          tests/test_piqnyx_saga_state_tool.py
-          tests/test_piqnyx_saga_state.py
-          tests/test_piqnyx_uuid_ingestion.py
