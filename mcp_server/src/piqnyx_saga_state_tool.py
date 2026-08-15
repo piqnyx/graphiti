@@ -45,6 +45,16 @@ def install_get_saga_tool(server: Any) -> None:
             # Reload by UUID through the scoped driver so every persisted Saga
             # property is hydrated by the canonical SagaNode deserializer.
             saga = await SagaNode.get_by_uuid(scoped_driver, match.uuid)
+            records, _, _ = await scoped_driver.execute_query(
+                """
+                MATCH (s:Saga {uuid: $uuid})-[:HAS_EPISODE]->(e:Episodic)
+                RETURN count(e) AS episode_count
+                """,
+                uuid=saga.uuid,
+                routing_='r',
+            )
+            episode_count = int(records[0]['episode_count']) if records else 0
+
             return SagaStateResponse(
                 message=f"Saga '{saga_name}' retrieved successfully",
                 uuid=saga.uuid,
@@ -54,6 +64,7 @@ def install_get_saga_tool(server: Any) -> None:
                 summary=saga.summary,
                 first_episode_uuid=saga.first_episode_uuid,
                 last_episode_uuid=saga.last_episode_uuid,
+                episode_count=episode_count,
             )
         except Exception as exc:
             server.logger.error(f'Error getting saga: {exc}')
