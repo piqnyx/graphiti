@@ -60,6 +60,7 @@ class SagaStateResponse(TypedDict):
     summary: str
     first_episode_uuid: str | None
     last_episode_uuid: str | None
+    episode_count: int
 
 
 class CommunityResult(TypedDict):
