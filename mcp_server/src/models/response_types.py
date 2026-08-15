@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 
 class ErrorResponse(TypedDict):
@@ -11,6 +11,7 @@ class ErrorResponse(TypedDict):
 
 class SuccessResponse(TypedDict):
     message: str
+    uuid: NotRequired[str]
 
 
 class NodeResult(TypedDict):

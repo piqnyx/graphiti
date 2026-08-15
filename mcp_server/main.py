@@ -20,6 +20,11 @@ sys.path.insert(0, str(src_path))
 
 # Import and run the original server
 if __name__ == '__main__':
+    # Install piqnyx's narrow MCP compatibility layer before tool registration.
+    from piqnyx_uuid_tool_patch import install_add_memory_uuid_response_patch
+
+    install_add_memory_uuid_response_patch()
+
     from graphiti_mcp_server import main
 
     # Pass all command line arguments to the original main function
