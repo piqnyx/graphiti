@@ -9,6 +9,8 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
+from datetime import datetime
 from typing import Any
 
 from services import queue_service as queue_module
@@ -63,6 +65,11 @@ class ReliableQueueService(_BaseQueueService):
         self._blocked_groups: dict[str, str] = {}
         self._failed_tasks: dict[str, Callable[[], Awaitable[None]]] = {}
         self._failed_attempts: dict[str, int] = {}
+        self._failed_metadata: dict[str, dict[str, Any]] = {}
+        self._task_metadata: dict[int, dict[str, Any]] = {}
+        self._enqueue_metadata: ContextVar[dict[str, Any] | None] = ContextVar(
+            f'piqnyx_queue_metadata_{id(self)}', default=None
+        )
 
     @staticmethod
     def _read_positive_int(value: int | None, env_name: str, default: int) -> int:
@@ -86,6 +93,55 @@ class ReliableQueueService(_BaseQueueService):
             raise ValueError(f'{env_name} must be a non-negative number')
         return parsed
 
+    async def add_episode(
+        self,
+        group_id: str,
+        name: str,
+        content: str,
+        source_description: str,
+        episode_type: Any,
+        entity_types: Any,
+        uuid: str | None,
+        reference_time: datetime | None = None,
+        edge_types: Any = None,
+        edge_type_map: Any = None,
+        excluded_entity_types: list[str] | None = None,
+        previous_episode_uuids: list[str] | None = None,
+        custom_extraction_instructions: str | None = None,
+        update_communities: bool = False,
+        saga: str | None = None,
+        saga_previous_episode_uuid: str | None = None,
+    ) -> int:
+        """Attach safe episode identity metadata while preserving upstream enqueue behavior."""
+        token = self._enqueue_metadata.set(
+            {
+                'episode_uuid': uuid,
+                'episode_name': name,
+                'saga': saga,
+            }
+        )
+        try:
+            return await super().add_episode(
+                group_id=group_id,
+                name=name,
+                content=content,
+                source_description=source_description,
+                episode_type=episode_type,
+                entity_types=entity_types,
+                uuid=uuid,
+                reference_time=reference_time,
+                edge_types=edge_types,
+                edge_type_map=edge_type_map,
+                excluded_entity_types=excluded_entity_types,
+                previous_episode_uuids=previous_episode_uuids,
+                custom_extraction_instructions=custom_extraction_instructions,
+                update_communities=update_communities,
+                saga=saga,
+                saga_previous_episode_uuid=saga_previous_episode_uuid,
+            )
+        finally:
+            self._enqueue_metadata.reset(token)
+
     async def add_episode_task(
         self, group_id: str, process_func: Callable[[], Awaitable[None]]
     ) -> int:
@@ -95,18 +151,30 @@ class ReliableQueueService(_BaseQueueService):
                 f"episode queue for group '{group_id}' is blocked by a failed predecessor: "
                 f'{last_error}'
             )
-        return await super().add_episode_task(group_id, process_func)
+
+        metadata = self._enqueue_metadata.get()
+        if metadata is not None:
+            self._task_metadata[id(process_func)] = dict(metadata)
+        try:
+            return await super().add_episode_task(group_id, process_func)
+        except Exception:
+            self._task_metadata.pop(id(process_func), None)
+            raise
 
     def is_group_blocked(self, group_id: str) -> bool:
         return group_id in self._blocked_groups
 
     def get_failure_status(self, group_id: str) -> dict[str, Any]:
+        metadata = self._failed_metadata.get(group_id, {})
         return {
             'group_id': group_id,
             'blocked': self.is_group_blocked(group_id),
             'attempts': self._failed_attempts.get(group_id, 0),
             'last_error': self._blocked_groups.get(group_id),
             'pending': self.get_queue_size(group_id),
+            'episode_uuid': metadata.get('episode_uuid'),
+            'episode_name': metadata.get('episode_name'),
+            'saga': metadata.get('saga'),
         }
 
     def _retry_delay(self, failed_attempt_number: int) -> float:
@@ -171,21 +239,27 @@ class ReliableQueueService(_BaseQueueService):
                     )
 
                     if success:
+                        self._task_metadata.pop(id(process_func), None)
                         self._blocked_groups.pop(group_id, None)
                         self._failed_tasks.pop(group_id, None)
                         self._failed_attempts.pop(group_id, None)
+                        self._failed_metadata.pop(group_id, None)
                         continue
 
                     error_text = str(last_error) if last_error is not None else 'unknown error'
                     self._blocked_groups[group_id] = error_text
                     self._failed_tasks[group_id] = process_func
                     self._failed_attempts[group_id] = attempts
+                    self._failed_metadata[group_id] = dict(
+                        self._task_metadata.get(id(process_func), {})
+                    )
                     logger.error(
                         'Blocking episode queue for group_id=%s after %d failed attempts; '
-                        'pending=%d error=%s',
+                        'pending=%d episode_uuid=%s error=%s',
                         group_id,
                         attempts,
                         self.get_queue_size(group_id),
+                        self._failed_metadata[group_id].get('episode_uuid'),
                         error_text,
                     )
                     return
@@ -215,6 +289,7 @@ class ReliableQueueService(_BaseQueueService):
         self._blocked_groups.pop(group_id, None)
         self._failed_tasks.pop(group_id, None)
         self._failed_attempts.pop(group_id, None)
+        self._failed_metadata.pop(group_id, None)
 
         self._queue_workers[group_id] = True
         try:
@@ -223,6 +298,9 @@ class ReliableQueueService(_BaseQueueService):
             self._queue_workers[group_id] = False
             self._blocked_groups[group_id] = 'failed to schedule retry worker'
             self._failed_tasks[group_id] = process_func
+            self._failed_metadata[group_id] = dict(
+                self._task_metadata.get(id(process_func), {})
+            )
             raise
         return True
 
