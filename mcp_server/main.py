@@ -28,11 +28,13 @@ if __name__ == '__main__':
     install_add_memory_uuid_response_patch()
 
     import graphiti_mcp_server as server
+    from piqnyx_queue_status_tool import install_get_queue_status_tool
     from piqnyx_saga_state_tool import install_get_saga_tool
 
-    # Register the fork-only read-only saga state tool after the upstream module
-    # has created its FastMCP instance, but before the server starts accepting requests.
+    # Register fork-only read-only operational tools after the upstream module
+    # has created its FastMCP instance, but before the server accepts requests.
     install_get_saga_tool(server)
+    install_get_queue_status_tool(server)
 
     # Pass all command line arguments to the original main function
     server.main()
