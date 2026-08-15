@@ -88,10 +88,51 @@ async def test_terminal_failure_blocks_group_and_preserves_pending_fifo():
         'attempts': 2,
         'last_error': 'broken predecessor',
         'pending': 1,
+        'episode_uuid': None,
+        'episode_name': None,
+        'saga': None,
     }
 
     with pytest.raises(EpisodeQueueBlockedError, match='failed predecessor'):
         await service.add_episode_task('main', pending_successor)
+
+
+@pytest.mark.asyncio
+async def test_blocked_status_identifies_failed_episode_without_content():
+    class FailingGraphiti:
+        async def add_episode(self, **_kwargs):
+            raise RuntimeError('provider exploded')
+
+    service = ReliableQueueService(
+        max_size_per_group=10,
+        process_max_attempts=1,
+        retry_base_seconds=0,
+        retry_max_seconds=0,
+    )
+    await service.initialize(FailingGraphiti())
+
+    await service.add_episode(
+        group_id='main',
+        name='6bc2a77c6957-7',
+        content='secret conversation body must not appear in status',
+        source_description='OpenClaw conversation batch',
+        episode_type='json',
+        entity_types=None,
+        uuid='episode-uuid-7',
+        saga='agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957',
+    )
+    await _wait_until(lambda: service.is_group_blocked('main'))
+
+    assert service.get_failure_status('main') == {
+        'group_id': 'main',
+        'blocked': True,
+        'attempts': 1,
+        'last_error': 'provider exploded',
+        'pending': 0,
+        'episode_uuid': 'episode-uuid-7',
+        'episode_name': '6bc2a77c6957-7',
+        'saga': 'agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957',
+    }
 
 
 @pytest.mark.asyncio
