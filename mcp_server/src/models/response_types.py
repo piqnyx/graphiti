@@ -51,6 +51,17 @@ class SagaSummaryResponse(TypedDict):
     summary: str
 
 
+class SagaStateResponse(TypedDict):
+    message: str
+    uuid: str
+    name: str
+    group_id: str
+    created_at: str | None
+    summary: str
+    first_episode_uuid: str | None
+    last_episode_uuid: str | None
+
+
 class CommunityResult(TypedDict):
     uuid: str
     name: str
