@@ -138,7 +138,11 @@ async def extract_edges(
 
     start = time()
 
-    extract_edges_max_tokens = 16384
+    # The only extraction call in core that pins its own output budget instead of
+    # using the configured one. A reasoning backend spends part of that budget on
+    # reasoning tokens before emitting any JSON, so on larger episodes 16K can be
+    # exhausted before the answer starts and the call returns an empty body.
+    extract_edges_max_tokens = 65536
     llm_client = clients.llm_client
 
     # Build mapping from edge type name to list of valid signatures

@@ -94,6 +94,14 @@ When a group queue is full, enqueue fails immediately with `EpisodeQueueFullErro
 
 Queue status exposes per-group pending/running state for diagnostics.
 
+### Edge extraction output budget
+
+`graphiti_core/utils/maintenance/edge_operations.py` is the only extraction path in core that pins its own `max_tokens` instead of using the configured one. Upstream pins 16384.
+
+The target deployment runs a reasoning backend, where `max_tokens` covers reasoning tokens as well as the answer: a probe of the deployed model returned an empty body with `finish_reason=length` once the budget was consumed before any JSON was emitted. An empty body raises `EmptyResponseError`, which is retried four times and then fails the episode, blocking that group's queue.
+
+The fork therefore raises this single constant to 65536 so the edge call has the same headroom as the configured budget for every other call. No other behavior changes; the value is a cap, not an allocation.
+
 ## Tested behavior
 
 The target deployment has exercised:
