@@ -8,6 +8,7 @@ never mutates graph data and never prints credentials.
 from __future__ import annotations
 
 import argparse
+import re
 import os
 import sys
 from collections.abc import Iterable
@@ -67,6 +68,43 @@ def _norm(value: Any) -> str:
 def _contains_term(values: Iterable[str], term: str) -> bool:
     needle = _norm(term)
     return any(needle in _norm(value) for value in values)
+
+
+BATCH_NAME_RE = re.compile(r'^(?P<prefix>.+)-(?P<number>\d+)$')
+NOTE_SOURCE_DESCRIPTION = 'OpenClaw agent note'
+
+
+def validate_batch_numbering(saga: Saga, episodes: list[Episode], report: Report) -> None:
+    """Episode names end with the batch number that produced them.
+
+    Both integrity failures seen in production are visible here without touching
+    a single edge: a duplicated batch repeats a number, a lost one leaves a gap.
+    """
+    numbers: dict[int, list[str]] = {}
+    unnumbered: list[str] = []
+    for episode in episodes:
+        match = BATCH_NAME_RE.match(episode.name or '')
+        if match is None:
+            unnumbered.append(episode.name)
+            continue
+        numbers.setdefault(int(match.group('number')), []).append(episode.uuid)
+
+    for name in unnumbered:
+        report.warn(f'{saga.name}: episode {name!r} has no batch number in its name')
+    for number, uuids in sorted(numbers.items()):
+        if len(uuids) > 1:
+            report.fail(
+                f'{saga.name}: batch {number} exists as {len(uuids)} separate episodes '
+                f'({", ".join(uuids)}); the same messages were committed more than once'
+            )
+    if numbers:
+        expected = set(range(min(numbers), max(numbers) + 1))
+        missing = sorted(expected - set(numbers))
+        if missing:
+            report.fail(
+                f'{saga.name}: batch number(s) {", ".join(map(str, missing))} are missing; '
+                'those messages never reached the graph'
+            )
 
 
 def validate_chain(
@@ -274,6 +312,104 @@ def load_next_edges(graph: Any) -> list[tuple[str, str]]:
     ]
 
 
+def load_group_hygiene(graph: Any, group_id: str) -> dict[str, list[Any]]:
+    """Checks that need the whole physical graph rather than one saga.
+
+    Isolation is the project's core invariant, so the group of every node and
+    fact edge is verified here rather than assumed. Episodes outside any saga are
+    legitimate for explicit notes and illegitimate for dialog batches, so the two
+    are told apart by source_description.
+    """
+    foreign_nodes = rows(
+        graph,
+        """
+        MATCH (n)
+        WHERE (n:Episodic OR n:Entity OR n:Saga) AND n.group_id <> $group_id
+        RETURN labels(n)[0], n.group_id, coalesce(n.name, n.uuid)
+        LIMIT 25
+        """,
+        group_id=group_id,
+    )
+    foreign_facts = rows(
+        graph,
+        """
+        MATCH (:Entity)-[r:RELATES_TO]->(:Entity)
+        WHERE r.group_id <> $group_id
+        RETURN r.group_id, r.fact
+        LIMIT 25
+        """,
+        group_id=group_id,
+    )
+    loose_episodes = rows(
+        graph,
+        """
+        MATCH (e:Episodic)
+        WHERE NOT (:Saga)-[:HAS_EPISODE]->(e)
+        RETURN e.name, e.source_description
+        LIMIT 25
+        """,
+    )
+    orphan_entities = rows(
+        graph,
+        """
+        MATCH (n:Entity)
+        WHERE NOT (n)-[:RELATES_TO]-()
+        RETURN n.name
+        LIMIT 200
+        """,
+    )
+    entity_total = rows(graph, 'MATCH (n:Entity) RETURN count(n)')
+    fact_total = rows(graph, 'MATCH (:Entity)-[r:RELATES_TO]->(:Entity) RETURN count(r)')
+    unsourced_facts = rows(
+        graph,
+        """
+        MATCH (:Entity)-[r:RELATES_TO]->(:Entity)
+        WHERE r.episodes IS NULL OR size(r.episodes) = 0
+        RETURN count(r)
+        """,
+    )
+    return {
+        'foreign_nodes': foreign_nodes,
+        'foreign_facts': foreign_facts,
+        'loose_episodes': loose_episodes,
+        'orphan_entities': orphan_entities,
+        'entity_total': entity_total[0][0] if entity_total else 0,
+        'fact_total': fact_total[0][0] if fact_total else 0,
+        'unsourced_facts': unsourced_facts[0][0] if unsourced_facts else 0,
+    }
+
+
+def validate_group_hygiene(group_id: str, hygiene: dict[str, list[Any]], report: Report) -> None:
+    for label, foreign_group, name in hygiene['foreign_nodes']:
+        report.fail(
+            f'{group_id}: {label} {name!r} carries group_id={foreign_group!r}; '
+            'per-agent isolation is broken'
+        )
+    for foreign_group, fact in hygiene['foreign_facts']:
+        report.fail(f'{group_id}: fact {str(fact)[:60]!r} carries group_id={foreign_group!r}')
+
+    for name, source_description in hygiene['loose_episodes']:
+        if source_description == NOTE_SOURCE_DESCRIPTION:
+            continue
+        report.fail(f'{group_id}: episode {name!r} belongs to no saga')
+
+    entity_total = int(hygiene['entity_total'])
+    orphans = [str(row[0]) for row in hygiene['orphan_entities']]
+    if entity_total:
+        share = len(orphans) * 100 // entity_total
+        message = (
+            f'{group_id}: {len(orphans)}/{entity_total} entities ({share}%) have no fact edge'
+        )
+        # Some isolated entities are normal; a majority of them means extraction
+        # is producing nouns without relationships.
+        (report.warn if share >= 40 else report.note)(message)
+    if hygiene['unsourced_facts']:
+        report.warn(
+            f"{group_id}: {hygiene['unsourced_facts']} fact(s) carry no episode provenance"
+        )
+    report.note(f"{group_id}: entities={entity_total} facts={hygiene['fact_total']}")
+
+
 def load_mentions(graph: Any, episode_ids: list[str]) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {uuid: [] for uuid in episode_ids}
     if not episode_ids:
@@ -386,6 +522,23 @@ def main() -> int:
         overall = Report()
 
         print(f'group={group_id} sagas={len(sagas)} read_only=true')
+
+        # Whole-graph checks run once, not per saga: isolation and extraction
+        # quality are properties of the physical graph.
+        hygiene_report = Report()
+        validate_group_hygiene(group_id, load_group_hygiene(graph, group_id), hygiene_report)
+        hygiene_status = (
+            'FAIL' if hygiene_report.failures else ('WARN' if hygiene_report.warnings else 'PASS')
+        )
+        print(f'\n[{hygiene_status}] group hygiene: isolation, provenance, extraction quality')
+        for note in hygiene_report.notes:
+            print(f'  INFO: {note}')
+        for warning in hygiene_report.warnings:
+            print(f'  WARN: {warning}')
+        for failure in hygiene_report.failures:
+            print(f'  FAIL: {failure}')
+        overall.failures.extend(hygiene_report.failures)
+        overall.warnings.extend(hygiene_report.warnings)
         for saga in sagas:
             report = Report()
             if saga.group_id != group_id:
@@ -402,6 +555,7 @@ def main() -> int:
                         f'{saga.name}: episode {episode.name} group_id={episode.group_id!r}, expected {group_id!r}'
                     )
 
+            validate_batch_numbering(saga, episodes, report)
             ordered = validate_chain(saga, episodes, all_next, report)
             episode_ids = [episode.uuid for episode in episodes]
             mentions = load_mentions(graph, episode_ids)
