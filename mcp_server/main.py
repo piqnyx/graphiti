@@ -21,16 +21,13 @@ sys.path.insert(0, str(src_path))
 # Import and run the original server
 if __name__ == '__main__':
     # Install piqnyx's narrow compatibility layers before tool/service registration.
-    from piqnyx_label_propagation_patch import install_bounded_label_propagation_patch
     from piqnyx_reliable_queue import install_reliable_queue_patch
     from piqnyx_uuid_tool_patch import install_add_memory_uuid_response_patch
 
     install_reliable_queue_patch()
-    install_bounded_label_propagation_patch()
     install_add_memory_uuid_response_patch()
 
     import graphiti_mcp_server as server
-    from piqnyx_community_tool import install_build_communities_for_group_tool
     from piqnyx_episode_lookup_tool import install_get_episodes_by_ref_tool
     from piqnyx_graph_stats_tool import install_get_graph_stats_tool
     from piqnyx_queue_status_tool import install_get_queue_status_tool
@@ -41,7 +38,6 @@ if __name__ == '__main__':
     install_get_saga_tool(server)
     install_get_queue_status_tool(server)
     install_get_graph_stats_tool(server)
-    install_build_communities_for_group_tool(server)
     install_get_episodes_by_ref_tool(server)
 
     # Pass all command line arguments to the original main function
