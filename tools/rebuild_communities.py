@@ -142,15 +142,24 @@ def main(argv: list[str]) -> int:
 
         content = message.get('result', {}).get('content', [])
         text = ' '.join(part.get('text', '') for part in content if isinstance(part, dict))
+
+        # A tool that fails returns its error inside the result, not in the
+        # JSON-RPC envelope. Checking only the envelope reported a failed run as
+        # "1 of 1 rebuilt" — the worst possible lie for something that runs at
+        # night and is read from a log the next morning.
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = {}
+        if isinstance(parsed, dict) and parsed.get('error'):
+            failures += 1
+            log(f'{group}: FAILED {parsed["error"]}')
+            continue
         # A skip is a normal outcome, not a silence to puzzle over later: the
         # schedule names every agent, and most of them are quiet most nights.
         # Read the flag rather than matching on the sentence, so rewording the
         # message cannot silently turn skips back into apparent rebuilds.
-        try:
-            skipped_flag = bool(json.loads(text).get('skipped'))
-        except (ValueError, AttributeError):
-            skipped_flag = False
-        if skipped_flag:
+        if isinstance(parsed, dict) and parsed.get('skipped'):
             skipped += 1
             log(f'{group}: skipped — {text[:300]}')
             continue
