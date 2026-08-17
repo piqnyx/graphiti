@@ -165,3 +165,30 @@ async def test_standalone_notes_are_not_counted_as_detached_episodes():
     # Without one, nothing is excluded: the caller decides what is deliberate.
     await server.mcp.tools['get_graph_stats']()
     assert captured['standalone'] is None
+
+
+@pytest.mark.asyncio
+async def test_a_parked_episode_is_not_reported_as_a_broken_chain():
+    captured = {}
+
+    class CapturingDriver(FakeDriver):
+        async def execute_query(self, cypher, routing_=None, **params):
+            if 'NEXT_EPISODE]->(e)' in cypher and 'HAS_EPISODE' in cypher:
+                captured['chain_heads'] = cypher
+            if 'successors > 1' in cypher:
+                captured['forks'] = cypher
+            return await super().execute_query(cypher, routing_=routing_, **params)
+
+    server = build_server(CapturingDriver({}))
+    patch.install_get_graph_stats_tool(server)
+    result = await server.mcp.tools['get_graph_stats'](group_id='main')
+
+    # Repairing a graph sometimes means taking an episode out of the sequence
+    # while keeping its text. Such an episode is not a second chain start, and
+    # without this the repair would be reported as damage for as long as it lives.
+    assert 'e.parked_reason IS NULL' in captured['chain_heads']
+    # A fork — one episode with two successors — carries two legitimate names, so
+    # the plugin's numbering check cannot see it. This is the only thing that can.
+    assert 'forks' in captured
+    assert 'forked_episodes' in result['integrity']
+    assert 'parked_episodes' in result['integrity']
