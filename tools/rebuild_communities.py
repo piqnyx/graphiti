@@ -120,13 +120,14 @@ def main(argv: list[str]) -> int:
     url = os.environ.get('GRAPHITI_MCP_URL', DEFAULT_URL)
     failures = 0
 
-    # One call per group, deliberately. build_communities accepts a list, but a
-    # single failing graph would then take the whole run down with it, and these
-    # graphs are meant to be isolated from each other's problems as well.
+    # One call per group, and the fork's group-scoped tool rather than the
+    # upstream one: upstream builds against the default database, which on this
+    # deployment is not where any agent's data lives. One call per group also
+    # keeps a single failing graph from taking the others down with it.
     for group in groups:
         log(f'building communities for {group}')
         try:
-            message = call_tool(url, 'build_communities', {'group_ids': [group]})
+            message = call_tool(url, 'build_communities_for_group', {'group_id': group})
         except Exception as error:  # noqa: BLE001 - a failed group must not stop the rest
             failures += 1
             log(f'{group}: FAILED {type(error).__name__}: {error}')
