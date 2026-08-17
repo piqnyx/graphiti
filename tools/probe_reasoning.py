@@ -33,6 +33,11 @@ import urllib.error
 import urllib.request
 
 TIMEOUT_SECONDS = 180
+# One sample decides nothing here. The same setting produced 148, 145 and 165
+# output tokens across three runs, and the objective difference being measured is
+# of the same order — so each candidate is sent several times and the median is
+# reported. The median rather than the mean: one runaway reply should not decide.
+REPEATS = int(os.environ.get('PROBE_REPEATS', '3'))
 # Large enough that a reasoning model is not truncated mid-thought — a truncated
 # answer would make the token counts meaningless — and small enough to be cheap.
 MAX_TOKENS = 8192
@@ -241,6 +246,7 @@ def main() -> int:
 
     mode = os.environ.get('PROBE_STRUCTURED_OUTPUT_MODE', 'json_schema').strip()
     print(f"extraction request built from graphiti's own prompt, structured_output_mode={mode}")
+    print(f'each candidate sent {REPEATS} times; the median is reported, spread in brackets')
 
     tasks = (
         ('trivial judgement', ([{'role': 'user', 'content': TRIVIAL_PROMPT}], None)),
@@ -252,13 +258,17 @@ def main() -> int:
         baseline_names: list[str] | None = None
         rows: list[tuple[str, str]] = []
         for label, extra in CANDIDATES:
-            result = ask(url, key, model, extra, request)
-            if not result['ok']:
-                rows.append((label, f'rejected — {result["why"]}'))
+            samples = [ask(url, key, model, extra, request) for _ in range(REPEATS)]
+            failed = next((sample for sample in samples if not sample['ok']), None)
+            if failed is not None:
+                rows.append((label, f'rejected — {failed["why"]}'))
                 print(f'  {label}: rejected')
                 continue
 
-            output = result['output']
+            counts = sorted(sample['output'] for sample in samples if isinstance(sample['output'], int))
+            result = samples[0]
+            spread = f' [{counts[0]}–{counts[-1]}]' if len(counts) > 1 and counts[0] != counts[-1] else ''
+            output = counts[len(counts) // 2] if counts else result['output']
             if baseline is None and not extra:
                 baseline = output
             change = ''
@@ -279,8 +289,8 @@ def main() -> int:
                     found += f' | MISSING vs baseline: {", ".join(missing)}'
                 if extra_found:
                     found += f' | extra: {", ".join(extra_found)}'
-            rows.append((label, f'output {output}{reasoning}{change}, finish={result["finish"]}{found}'))
-            print(f'  {label}: output {output}{reasoning}{change}{found}')
+            rows.append((label, f'median output {output}{spread}{reasoning}{change}, finish={result["finish"]}{found}'))
+            print(f'  {label}: median output {output}{spread}{reasoning}{change}{found}')
 
         print('  ' + '-' * 70)
         for label, outcome in rows:
@@ -294,7 +304,8 @@ def main() -> int:
     print('worth wiring in is one that cuts output on extraction while extracting the')
     print('same entities. "MISSING vs baseline" is the column that decides: fewer tokens')
     print('for fewer entities is damage, not economy, and the token count alone cannot')
-    print('tell the two apart.')
+    print('tell the two apart. Ignore a difference smaller than the bracketed spread:')
+    print('this model varies enough between identical runs to invent one.')
     return 0
 
 
