@@ -148,16 +148,6 @@ class LLMConfig(BaseModel):
 
     provider: str = Field(default='openai', description='LLM provider')
     model: str = Field(default='gpt-5.5', description='Model name')
-    small_model: str | None = Field(
-        default=None,
-        description=(
-            'Model for the small, mechanical calls graphiti makes on every batch: entity '
-            'attribute extraction, edge timestamps, edge deduplication, and community '
-            'summaries. Defaults to `model`. Worth setting to a cheap, non-reasoning model: '
-            'these calls merge a sentence or pick a date, and a reasoning model can spend '
-            'tens of thousands of output tokens doing it.'
-        ),
-    )
     temperature: float | None = Field(
         default=None, description='Temperature (optional, defaults to None for reasoning models)'
     )
