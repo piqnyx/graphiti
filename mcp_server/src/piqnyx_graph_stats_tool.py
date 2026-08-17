@@ -190,11 +190,17 @@ def install_get_graph_stats_tool(server: Any) -> None:
         # One head per saga is correct: the chain starts somewhere. More than one
         # means the NEXT_EPISODE chain was broken and restarted, which is exactly
         # the failure the numbering check in the plugin cannot see.
+        #
+        # An episode carrying parked_reason is excluded. Repairing a damaged graph
+        # sometimes means taking an episode out of the sequence while keeping its
+        # text — a duplicate batch number, say — and such an episode is neither a
+        # chain start nor a defect. Without this the repair itself would be
+        # reported as damage for as long as the graph lives.
         chain_heads = await query(
             'chain_heads_per_saga',
             """
             MATCH (s:Saga)-[:HAS_EPISODE]->(e:Episodic)
-            WHERE NOT ()-[:NEXT_EPISODE]->(e)
+            WHERE NOT ()-[:NEXT_EPISODE]->(e) AND e.parked_reason IS NULL
             WITH s.name AS saga, count(e) AS heads
             WHERE heads > 1
             RETURN saga AS saga, heads AS heads
@@ -202,6 +208,34 @@ def install_get_graph_stats_tool(server: Any) -> None:
             LIMIT $limit
             """,
             limit=limit,
+        )
+
+        # An episode with two successors means a batch was chained twice: the
+        # plugin's numbering check cannot see this, because both branches carry
+        # legitimate, different names.
+        forked_episodes = await query(
+            'forked_chain',
+            """
+            MATCH (a:Episodic)-[:NEXT_EPISODE]->()
+            WITH a, count(*) AS successors
+            WHERE successors > 1
+            RETURN a.name AS name, successors AS successors
+            ORDER BY successors DESC, name ASC
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+
+        parked = scalar(
+            await query(
+                'parked_episodes',
+                """
+                MATCH (e:Episodic)
+                WHERE e.parked_reason IS NOT NULL
+                RETURN count(e) AS value
+                """,
+            ),
+            'value',
         )
 
         facts_without_source = scalar(
@@ -247,6 +281,8 @@ def install_get_graph_stats_tool(server: Any) -> None:
                 'episodes_without_saga': orphan_episodes,
                 'episodes_without_entities': silent_episodes,
                 'sagas_with_broken_chain': chain_heads,
+                'forked_episodes': forked_episodes,
+                'parked_episodes': parked,
                 'facts_without_provenance': facts_without_source,
                 'isolated_entities': isolated_entities,
             },
