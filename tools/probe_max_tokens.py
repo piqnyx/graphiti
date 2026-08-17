@@ -130,9 +130,23 @@ def main() -> int:
     print(f'largest accepted max_tokens: {good}')
     print(f'first rejected: {bad}')
     print()
-    print('Put a value at or below the accepted figure in ~/memory/graphiti/config.yaml:')
+
+    # Providers typically check prompt + max_tokens against the context window
+    # rather than capping output on its own. This probe sends a two-token prompt,
+    # so what it finds is very nearly the whole window — and configuring that
+    # figure would make every real request fail, since a real prompt occupies part
+    # of the same budget. The recommendation therefore keeps most of the window
+    # free for input, which is where extraction actually needs it.
+    recommended = 1 << (good // 3).bit_length() - 1
+    print('The figure above is close to the model\'s whole context window, not an output-only cap:')
+    print('a real request must fit prompt + max_tokens inside it, so configuring that value would')
+    print('fail on every extraction large enough to matter. Leave the input room it needs:')
+    print()
     print('  llm:')
-    print(f'    max_tokens: {good}')
+    print(f'    max_tokens: {recommended}')
+    print()
+    print(f'That leaves roughly {good - recommended} tokens for the prompt, and is far more output')
+    print('than extraction ever produces — the ceiling only has to stop truncation, not be reached.')
     return 0
 
 
