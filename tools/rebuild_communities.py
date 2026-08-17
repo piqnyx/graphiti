@@ -119,6 +119,8 @@ def main(argv: list[str]) -> int:
 
     url = os.environ.get('GRAPHITI_MCP_URL', DEFAULT_URL)
     failures = 0
+    rebuilt = 0
+    skipped = 0
 
     # One call per group, and the fork's group-scoped tool rather than the
     # upstream one: upstream builds against the default database, which on this
@@ -140,9 +142,25 @@ def main(argv: list[str]) -> int:
 
         content = message.get('result', {}).get('content', [])
         text = ' '.join(part.get('text', '') for part in content if isinstance(part, dict))
+        # A skip is a normal outcome, not a silence to puzzle over later: the
+        # schedule names every agent, and most of them are quiet most nights.
+        # Read the flag rather than matching on the sentence, so rewording the
+        # message cannot silently turn skips back into apparent rebuilds.
+        try:
+            skipped_flag = bool(json.loads(text).get('skipped'))
+        except (ValueError, AttributeError):
+            skipped_flag = False
+        if skipped_flag:
+            skipped += 1
+            log(f'{group}: skipped — {text[:300]}')
+            continue
+        rebuilt += 1
         log(f'{group}: {text[:500] or "done"}')
 
-    log(f'finished: {len(groups) - failures} of {len(groups)} group(s) rebuilt')
+    log(
+        f'finished: {rebuilt} rebuilt, {skipped} skipped, {failures} failed '
+        f'out of {len(groups)} group(s)'
+    )
     return 1 if failures else 0
 
 

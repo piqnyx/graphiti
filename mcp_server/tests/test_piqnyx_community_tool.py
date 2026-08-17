@@ -20,11 +20,16 @@ class FakeMcp:
 
 
 class FakeDriver:
-    def __init__(self, database='default_db'):
+    def __init__(self, database='default_db', row=None):
         self.database = database
+        # Default row: a populated graph that has never had communities built.
+        self.row = row if row is not None else {'entities': 5, 'built_at': None, 'newest': '2026-08-17T06:00:00'}
 
     def clone(self, database):
-        return FakeDriver(database)
+        return FakeDriver(database, self.row)
+
+    async def execute_query(self, cypher, routing_=None, **params):
+        return [self.row], None, None
 
 
 class FakeClient:
@@ -76,3 +81,53 @@ async def test_a_missing_group_is_refused_rather_than_defaulted():
 
     assert 'group_id is required' in result['error']
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_graph_is_skipped_instead_of_rebuilt():
+    client = FakeClient()
+    # Newest episode predates the last build: rebuilding would reproduce the
+    # summaries that already exist, at roughly one LLM call per entity.
+    client.driver = FakeDriver(row={
+        'entities': 40,
+        'built_at': '2026-08-17T04:00:00',
+        'newest': '2026-08-16T20:00:00',
+    })
+    server = build_server(client)
+    patch.install_build_communities_for_group_tool(server)
+
+    result = await server.mcp.tools['build_communities_for_group']('igor')
+
+    assert result['skipped'] is True
+    assert result['reason'] == 'no_new_episodes'
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_empty_graph_is_skipped():
+    client = FakeClient()
+    client.driver = FakeDriver(row={'entities': 0, 'built_at': None, 'newest': None})
+    server = build_server(client)
+    patch.install_build_communities_for_group_tool(server)
+
+    result = await server.mcp.tools['build_communities_for_group']('orange')
+
+    assert result['reason'] == 'empty_graph'
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_force_rebuilds_a_graph_that_would_otherwise_be_skipped():
+    client = FakeClient()
+    client.driver = FakeDriver(row={
+        'entities': 40,
+        'built_at': '2026-08-17T04:00:00',
+        'newest': '2026-08-16T20:00:00',
+    })
+    server = build_server(client)
+    patch.install_build_communities_for_group_tool(server)
+
+    result = await server.mcp.tools['build_communities_for_group']('igor', force=True)
+
+    assert result['skipped'] is False
+    assert client.calls[0]['driver'].database == 'igor'
