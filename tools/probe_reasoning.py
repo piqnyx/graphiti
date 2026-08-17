@@ -38,6 +38,16 @@ TIMEOUT_SECONDS = 180
 MAX_TOKENS = 8192
 USER_AGENT = os.environ.get('PROBE_USER_AGENT', '').strip() or 'graphiti-reasoning-probe/1'
 
+# The extraction task is graphiti's own, not an imitation of it.
+#
+# A first version of this probe sent a hand-written prompt as a single user
+# message with no response_format, and concluded from it that the model does not
+# reason. That conclusion was worthless: the real request carries a system role,
+# a long instruction list, an enforced JSON schema, and — in json_object mode —
+# the schema pasted into the prompt as well. Any of those can change how much a
+# model deliberates. So the prompt and the response model are imported from the
+# library, and the request is assembled the way the client assembles it.
+#
 # Two tasks, because one of them cannot answer the question.
 #
 # The trivial one measures whether a setting is honoured at all: if the baseline
@@ -51,22 +61,6 @@ TRIVIAL_PROMPT = (
     'Two statements: "Вит живёт в Григолети" and "Вит живёт в селе Григолети рядом с Батуми". '
     'Do they describe the same fact? Answer with JSON only: {"same": true or false}.'
 )
-
-EXTRACTION_PROMPT = """You extract a knowledge graph from a conversation.
-
-Conversation:
-Вит: Мы с Олей завели в Йошкар-Оле собаку Басю, жирного английского бульдога.
-Краб: Бульдоги — те ещё лежебоки. Она с вами и в Кишинёв переехала?
-Вит: Нет, при расставании с Олей я отдал Басю в добрые руки. Оля потом улетела в Краснодар.
-Краб: А Камыш? Ты говорил, он твой давний кент.
-Вит: Камыш со школы, мы с ним в Йошке в одном дворе росли. Сейчас он в Москве, работает на стройке.
-Вит: Я сам теперь живу в Григолети под Батуми, в доме на колёсах у моря.
-
-Return JSON only, no prose, in exactly this shape:
-{"entities": [{"name": "...", "type": "person|place|animal|other"}],
- "facts": [{"subject": "...", "predicate": "...", "object": "...", "valid_now": true}]}
-Include every person, place and animal mentioned, and every relationship stated,
-including ones that are no longer true, marking those valid_now false."""
 
 CANDIDATES: list[tuple[str, dict]] = [
     ('baseline (nothing sent)', {}),
@@ -84,12 +78,86 @@ CANDIDATES: list[tuple[str, dict]] = [
 ]
 
 
-def ask(url: str, key: str, model: str, extra: dict, prompt: str) -> dict:
+# The plugin's own extraction guidance, sent with every batch.
+#
+# Without it the model treats the body as opaque and never descends into the
+# messages array, so extraction returns almost nothing — which makes measuring
+# anything without it meaningless. Kept in step with CUSTOM_EXTRACTION_PROMPT in
+# graphiti-openclaw-plugin/src/mcp-client.ts.
+CUSTOM_EXTRACTION_INSTRUCTIONS = (
+    'This JSON is a conversation between the two participants whose canonical names are in '
+    '"participants.user" and "participants.assistant". "messages" is an ARRAY of message objects, '
+    'each with a "text" field. Extract ALL entities from the "text" field of each message in the '
+    '"messages" array. The participants often refer to each other and to people by name; a name may '
+    'appear in slightly different forms (case, nicknames). When a mentioned name clearly refers to '
+    'one of the participants, treat it as the same entity. Do not merge different people into one '
+    'unless it is clearly the same person. Respect all other extraction rules.'
+)
+
+
+def graphiti_extraction_request() -> tuple[list[dict], dict | None]:
+    """Build the messages and response_format graphiti itself would send.
+
+    Mirrors OpenAIGenericClient: the library's prompt, its response model, the
+    multilingual instruction appended to the system message, and the schema
+    pasted into the last message when the configured mode is json_object.
+    """
+    from graphiti_core.llm_client.client import get_extraction_language_instruction
+    from graphiti_core.prompts import prompt_library
+    from graphiti_core.prompts.extract_nodes import ExtractedEntities
+
+    # The episode body exactly as the plugin writes it: participants under their
+    # canonical names, and the turns as the array those instructions refer to.
+    episode_body = json.dumps(
+        {
+            'participants': {'user': 'Вит', 'assistant': 'Краб'},
+            'messages': [
+                {'role': 'user', 'text': 'Мы с Олей завели в Йошкар-Оле собаку Басю, жирного английского бульдога.'},
+                {'role': 'assistant', 'text': 'Бульдоги — те ещё лежебоки. Она с вами и в Кишинёв переехала?'},
+                {'role': 'user', 'text': 'Нет, при расставании с Олей я отдал Басю в добрые руки. Оля потом улетела в Краснодар.'},
+                {'role': 'assistant', 'text': 'А Камыш? Ты говорил, он твой давний кент.'},
+                {'role': 'user', 'text': 'Камыш со школы, мы росли в одном дворе в Йошке. Сейчас он в Москве, работает на стройке.'},
+                {'role': 'user', 'text': 'Я сам теперь живу в Григолети под Батуми, в доме на колёсах у моря.'},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    context = {
+        'episode_content': episode_body,
+        'previous_episodes': [],
+        'entity_types': '0: Entity — any person, place, organization, animal or named thing',
+        'custom_prompt': '',
+        'custom_extraction_instructions': CUSTOM_EXTRACTION_INSTRUCTIONS,
+        'source_description': 'OpenClaw conversation batch',
+    }
+    # extract_json, not extract_message: the plugin submits source="json", and the
+    # server picks the prompt from that. Probing the message prompt would exercise
+    # a path this deployment never takes.
+    messages = prompt_library.extract_nodes.extract_json(context)
+    payload_messages = [{'role': message.role, 'content': message.content} for message in messages]
+    payload_messages[0]['content'] += get_extraction_language_instruction('main')
+
+    mode = os.environ.get('PROBE_STRUCTURED_OUTPUT_MODE', 'json_schema').strip()
+    if mode == 'json_object':
+        payload_messages[-1]['content'] += (
+            '\n\nRespond with a JSON object in the following format:\n\n'
+            + json.dumps(ExtractedEntities.model_json_schema())
+        )
+        return payload_messages, {'type': 'json_object'}
+    return payload_messages, {
+        'type': 'json_schema',
+        'json_schema': {'name': 'ExtractedEntities', 'schema': ExtractedEntities.model_json_schema()},
+    }
+
+
+def ask(url: str, key: str, model: str, extra: dict, request: tuple[list[dict], dict | None]) -> dict:
     """Send the probe once and report what came back, without raising."""
+    messages, response_format = request
     payload = {
         'model': model,
-        'messages': [{'role': 'user', 'content': prompt}],
+        'messages': messages,
         'max_tokens': MAX_TOKENS,
+        **({'response_format': response_format} if response_format else {}),
         **extra,
     }
     request = urllib.request.Request(
@@ -136,12 +204,25 @@ def main() -> int:
 
     print(f'model: {model}')
 
-    for task, prompt in (('trivial judgement', TRIVIAL_PROMPT), ('real extraction', EXTRACTION_PROMPT)):
+    try:
+        extraction = graphiti_extraction_request()
+    except ImportError as error:
+        print(f'graphiti_core is not importable ({error}); run this inside the graphiti-server container', file=sys.stderr)
+        return 2
+
+    mode = os.environ.get('PROBE_STRUCTURED_OUTPUT_MODE', 'json_schema').strip()
+    print(f"extraction request built from graphiti's own prompt, structured_output_mode={mode}")
+
+    tasks = (
+        ('trivial judgement', ([{'role': 'user', 'content': TRIVIAL_PROMPT}], None)),
+        ("graphiti's own entity extraction", extraction),
+    )
+    for task, request in tasks:
         print(f'\n=== {task} ===')
         baseline: int | None = None
         rows: list[tuple[str, str]] = []
         for label, extra in CANDIDATES:
-            result = ask(url, key, model, extra, prompt)
+            result = ask(url, key, model, extra, request)
             if not result['ok']:
                 rows.append((label, f'rejected — {result["why"]}'))
                 print(f'  {label}: rejected')
