@@ -216,6 +216,49 @@ def install_get_graph_stats_tool(server: Any) -> None:
             'value',
         )
 
+        # Communities are built by a separate scheduled run, never on this path:
+        # summarising a cluster calls an LLM per community and takes as long as it
+        # takes, and a diagnostic must stay cheap. Here they are only read.
+        communities = await query(
+            'communities',
+            """
+            MATCH (c:Community)
+            OPTIONAL MATCH (c)-[:HAS_MEMBER]->(m)
+            WITH c, count(m) AS members
+            RETURN c.name AS name, members AS members, c.summary AS summary,
+                   c.created_at AS created_at
+            ORDER BY members DESC, name ASC
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        community_count = scalar(
+            await query('community_count', 'MATCH (c:Community) RETURN count(c) AS value'),
+            'value',
+        )
+        community_built_at = scalar(
+            await query(
+                'communities_built_at',
+                'MATCH (c:Community) RETURN max(c.created_at) AS value',
+            ),
+            'value',
+            None,
+        )
+        # What has arrived since the last build is the honest measure of how stale
+        # the summaries are — far more useful than the age of the build alone.
+        episodes_since_build = scalar(
+            await query(
+                'episodes_since_communities',
+                """
+                MATCH (e:Episodic)
+                WHERE $built IS NOT NULL AND e.created_at > $built
+                RETURN count(e) AS value
+                """,
+                built=community_built_at,
+            ),
+            'value',
+        )
+
         isolated_entities = scalar(
             await query(
                 'isolated_entities',
@@ -240,6 +283,12 @@ def install_get_graph_stats_tool(server: Any) -> None:
             },
             'top_entities': top,
             'episodes_per_saga': per_saga,
+            'communities': {
+                'count': community_count,
+                'built_at': community_built_at,
+                'episodes_since_build': episodes_since_build,
+                'largest': communities,
+            },
             'oldest_episode': oldest[0] if oldest else None,
             'newest_episode': newest[0] if newest else None,
             'integrity': {

@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Rebuild community summaries for one or more graphs, on a schedule.
+
+Communities group densely connected entities and give each group an LLM-written
+summary. That makes this the most expensive operation the server offers, which is
+why it lives here and not in any tool an agent can call: a diagnostic must answer
+immediately, and this does not. The summaries land in the graph as Community
+nodes, so nothing is written to disk and no report can drift from reality — the
+status tool reads what this run produced.
+
+Written for cron. Every line is timestamped and the exit code is meaningful, so a
+run that fails at three in the morning is visible in the log rather than showing
+up a week later as a stale summary.
+
+    python3 tools/rebuild_communities.py main igor
+
+Environment:
+    GRAPHITI_MCP_URL   MCP endpoint, default http://127.0.0.1:8000/mcp/
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+DEFAULT_URL = 'http://127.0.0.1:8000/mcp/'
+# Community building runs over every entity in a graph and calls an LLM per
+# cluster; on a large graph tens of minutes is normal, not a hang.
+TIMEOUT_SECONDS = 3600
+
+
+def log(message: str) -> None:
+    print(f'{datetime.now(timezone.utc).isoformat(timespec="seconds")} {message}', flush=True)
+
+
+def call_tool(url: str, name: str, arguments: dict) -> dict:
+    """Invoke one MCP tool over Streamable HTTP and return its parsed result."""
+    session_id = None
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+    }
+
+    def post(body: dict) -> tuple[str, dict]:
+        request = urllib.request.Request(
+            url, data=json.dumps(body).encode(), headers={**headers, **({'Mcp-Session-Id': session_id} if session_id else {})}
+        )
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            return response.read().decode('utf-8', 'replace'), dict(response.headers)
+
+    # Handshake first: the server assigns a session id that every later call must
+    # carry, and rejects tool calls made without one.
+    payload, response_headers = post(
+        {
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'initialize',
+            'params': {
+                'protocolVersion': '2025-06-18',
+                'capabilities': {},
+                'clientInfo': {'name': 'rebuild-communities', 'version': '1'},
+            },
+        }
+    )
+    session_id = response_headers.get('Mcp-Session-Id') or response_headers.get('mcp-session-id')
+    post({'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {}})
+
+    payload, _ = post(
+        {
+            'jsonrpc': '2.0',
+            'id': 2,
+            'method': 'tools/call',
+            'params': {'name': name, 'arguments': arguments},
+        }
+    )
+
+    # Streamable HTTP may answer as an SSE stream; the JSON is on the data lines.
+    for line in payload.splitlines():
+        line = line.strip()
+        if line.startswith('data:'):
+            line = line[5:].strip()
+        if not line.startswith('{'):
+            continue
+        message = json.loads(line)
+        if message.get('id') == 2:
+            return message
+    raise RuntimeError(f'no result in response: {payload[:300]}')
+
+
+def main(argv: list[str]) -> int:
+    groups = argv[1:]
+    if not groups:
+        print(__doc__, file=sys.stderr)
+        print('give at least one group id (one per agent)', file=sys.stderr)
+        return 2
+
+    url = os.environ.get('GRAPHITI_MCP_URL', DEFAULT_URL)
+    failures = 0
+
+    # One call per group, deliberately. build_communities accepts a list, but a
+    # single failing graph would then take the whole run down with it, and these
+    # graphs are meant to be isolated from each other's problems as well.
+    for group in groups:
+        log(f'building communities for {group}')
+        try:
+            message = call_tool(url, 'build_communities', {'group_ids': [group]})
+        except Exception as error:  # noqa: BLE001 - a failed group must not stop the rest
+            failures += 1
+            log(f'{group}: FAILED {type(error).__name__}: {error}')
+            continue
+
+        if 'error' in message:
+            failures += 1
+            log(f'{group}: FAILED {message["error"]}')
+            continue
+
+        content = message.get('result', {}).get('content', [])
+        text = ' '.join(part.get('text', '') for part in content if isinstance(part, dict))
+        log(f'{group}: {text[:500] or "done"}')
+
+    log(f'finished: {len(groups) - failures} of {len(groups)} group(s) rebuilt')
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv))
