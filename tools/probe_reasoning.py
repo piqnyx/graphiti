@@ -185,13 +185,42 @@ def ask(url: str, key: str, model: str, extra: dict, request: tuple[list[dict], 
     # Providers report reasoning tokens in different places, when they report them
     # at all; the total output count is the figure that is always comparable.
     details = usage.get('completion_tokens_details') or {}
+    content = str(message.get('content') or '')
     return {
         'ok': True,
         'output': usage.get('completion_tokens'),
         'reasoning': details.get('reasoning_tokens'),
-        'answer': ' '.join(str(message.get('content') or '').split())[:120],
+        'entities': extracted_entity_names(content),
+        'answer': ' '.join(content.split())[:120],
         'finish': choice.get('finish_reason'),
     }
+
+
+def extracted_entity_names(content: str) -> list[str] | None:
+    """The entity names in an extraction reply, or None if it is not one.
+
+    This is the half the token counts cannot supply. Half the output tokens is a
+    saving only if the same entities come back; if Камыш or Бася went missing it
+    is damage, and the two look identical in a token count.
+    """
+    text = content.strip()
+    if text.startswith('```'):
+        text = text.strip('`')
+        text = text[4:] if text.lower().startswith('json') else text
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    entities = parsed.get('extracted_entities')
+    if not isinstance(entities, list):
+        return None
+    names = []
+    for entity in entities:
+        if isinstance(entity, dict) and isinstance(entity.get('name'), str):
+            names.append(entity['name'])
+    return names
 
 
 def main() -> int:
@@ -220,6 +249,7 @@ def main() -> int:
     for task, request in tasks:
         print(f'\n=== {task} ===')
         baseline: int | None = None
+        baseline_names: list[str] | None = None
         rows: list[tuple[str, str]] = []
         for label, extra in CANDIDATES:
             result = ask(url, key, model, extra, request)
@@ -236,8 +266,21 @@ def main() -> int:
                 delta = round((output - baseline) / baseline * 100)
                 change = f' ({delta:+d}% vs baseline)'
             reasoning = f', reasoning {result["reasoning"]}' if result['reasoning'] is not None else ''
-            rows.append((label, f'output {output}{reasoning}{change}, finish={result["finish"]}'))
-            print(f'  {label}: output {output}{reasoning}{change}')
+            names = result['entities']
+            if names is None:
+                found = f', answer: {result["answer"]}'
+            else:
+                if baseline_names is None and not extra:
+                    baseline_names = names
+                missing = sorted(set(baseline_names or []) - set(names))
+                extra_found = sorted(set(names) - set(baseline_names or []))
+                found = f', {len(names)} entities: {", ".join(names) if names else "none"}'
+                if missing:
+                    found += f' | MISSING vs baseline: {", ".join(missing)}'
+                if extra_found:
+                    found += f' | extra: {", ".join(extra_found)}'
+            rows.append((label, f'output {output}{reasoning}{change}, finish={result["finish"]}{found}'))
+            print(f'  {label}: output {output}{reasoning}{change}{found}')
 
         print('  ' + '-' * 70)
         for label, outcome in rows:
@@ -248,8 +291,10 @@ def main() -> int:
     print('a baseline of a few tokens leaves nothing to remove, so a setting that')
     print('disables reasoning looks exactly like one that was ignored. The extraction')
     print('task is the one that decides, because the model does think there. A setting')
-    print('worth wiring in is one that cuts output on extraction without wrecking the')
-    print('answer — so read the JSON in the last column too, not only the numbers.')
+    print('worth wiring in is one that cuts output on extraction while extracting the')
+    print('same entities. "MISSING vs baseline" is the column that decides: fewer tokens')
+    print('for fewer entities is damage, not economy, and the token count alone cannot')
+    print('tell the two apart.')
     return 0
 
 
