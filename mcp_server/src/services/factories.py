@@ -144,11 +144,8 @@ class LLMClientFactory:
 
                 from graphiti_core.llm_client.config import LLMConfig as CoreLLMConfig
 
-                # The small slot carries the mechanical calls made on every batch —
-                # entity attributes, edge timestamps, edge dedup — so pointing it at a
-                # cheap non-reasoning model is the difference between a few hundred
-                # output tokens per call and tens of thousands. Same model unless asked.
-                small_model = config.small_model or config.model
+                # Use the same model for both main and small model slots
+                small_model = config.model
 
                 llm_config = CoreLLMConfig(
                     api_key=api_key,
