@@ -21,10 +21,12 @@ sys.path.insert(0, str(src_path))
 # Import and run the original server
 if __name__ == '__main__':
     # Install piqnyx's narrow compatibility layers before tool/service registration.
+    from piqnyx_label_propagation_patch import install_bounded_label_propagation_patch
     from piqnyx_reliable_queue import install_reliable_queue_patch
     from piqnyx_uuid_tool_patch import install_add_memory_uuid_response_patch
 
     install_reliable_queue_patch()
+    install_bounded_label_propagation_patch()
     install_add_memory_uuid_response_patch()
 
     import graphiti_mcp_server as server
