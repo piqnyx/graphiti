@@ -102,6 +102,35 @@ The target deployment runs a reasoning backend, where `max_tokens` covers reason
 
 The fork therefore raises this single constant to 65536 so the edge call has the same headroom as the configured budget for every other call. No other behavior changes; the value is a cap, not an allocation.
 
+### Fork-only read-only tools
+
+Four MCP tools exist only here. Each lives in its own `piqnyx_*` module and is
+registered from `mcp_server/main.py` after upstream has created its FastMCP
+instance, so no upstream tool definition is modified. All are read-only, take no
+LLM, and are scoped to the physical graph selected by `group_id`.
+
+```text
+get_saga(saga_name, group_id)              persisted saga state and episode count
+get_queue_status(group_id)                 in-memory queue health, including blocked state
+get_graph_stats(group_id, top_entities)    size, most connected entities, memory age,
+                                           integrity: duplicate episode names, episodes
+                                           with no saga or no entities, sagas whose
+                                           NEXT_EPISODE chain restarted, facts with no
+                                           source episode, isolated entities
+get_episodes_by_ref(uuids, names, group_id) specific episodes with their full text
+```
+
+`get_graph_stats` runs each query independently and reports failures in
+`query_errors` rather than aborting: a diagnostic is needed precisely when the
+graph is in an unusual state, so one unsupported query must not cost the whole
+report.
+
+`get_episodes_by_ref` exists because upstream can only return "the most recent N"
+episodes. Facts record the uuids of the episodes that produced them, and episode
+names carry a batch number, so a lookup by uuid finds a fact's source and a
+lookup by name reaches its neighbours in the chain. The plugin's memory-context
+tool is built entirely on this.
+
 ## Tested behavior
 
 The target deployment has exercised:
@@ -167,6 +196,7 @@ Do not casually merge or rebase this fork onto a newer Graphiti release. Before 
 3. re-run concurrent ingestion stress;
 4. verify structured-output behavior with the configured LLM provider;
 5. verify MCP episode scoping and queue behavior;
-6. only then update the deployment image/tag.
+6. re-register the four fork-only tools and confirm the plugin still sees them;
+7. only then update the deployment image/tag.
 
 The target stack values a boring, pinned memory backend more than novelty. Memory infrastructure is a poor place for surprise archaeology.
