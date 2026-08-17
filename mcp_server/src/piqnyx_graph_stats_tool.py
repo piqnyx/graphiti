@@ -27,6 +27,7 @@ def install_get_graph_stats_tool(server: Any) -> None:
     async def get_graph_stats(
         group_id: str | None = None,
         top_entities: int = DEFAULT_TOP_ENTITIES,
+        standalone_source_description: str | None = None,
     ) -> dict[str, Any] | ErrorResponse:
         """Return size, shape and integrity diagnostics for one isolated graph.
 
@@ -38,6 +39,10 @@ def install_get_graph_stats_tool(server: Any) -> None:
         Args:
             group_id: Graph to inspect; defaults to the configured group.
             top_entities: How many of the most connected entities to list.
+            standalone_source_description: Episodes written with this
+                source_description belong to no dialog by design — a standalone
+                note must not join a dialog's chain — so they are excluded from
+                the detached-episode count instead of being reported as damage.
         """
         if server.graphiti_service is None:
             return ErrorResponse(error='Graphiti service not initialized')
@@ -162,8 +167,10 @@ def install_get_graph_stats_tool(server: Any) -> None:
                 """
                 MATCH (e:Episodic)
                 WHERE NOT (:Saga)-[:HAS_EPISODE]->(e)
+                  AND ($standalone IS NULL OR e.source_description <> $standalone)
                 RETURN count(e) AS value
                 """,
+                standalone=standalone_source_description,
             ),
             'value',
         )

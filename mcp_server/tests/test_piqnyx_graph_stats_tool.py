@@ -142,3 +142,26 @@ async def test_refuses_when_no_group_can_be_resolved():
 
     # ErrorResponse is a TypedDict, so the failure arrives as a plain mapping.
     assert 'no default group_id' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_standalone_notes_are_not_counted_as_detached_episodes():
+    captured = {}
+
+    class CapturingDriver(FakeDriver):
+        async def execute_query(self, cypher, routing_=None, **params):
+            if 'NOT (:Saga)-[:HAS_EPISODE]->(e)' in cypher:
+                captured['cypher'] = cypher
+                captured['standalone'] = params.get('standalone')
+            return await super().execute_query(cypher, routing_=routing_, **params)
+
+    server = build_server(CapturingDriver({}))
+    patch.install_get_graph_stats_tool(server)
+
+    await server.mcp.tools['get_graph_stats'](standalone_source_description='OpenClaw agent note')
+    assert captured['standalone'] == 'OpenClaw agent note'
+    assert 'e.source_description <> $standalone' in captured['cypher']
+
+    # Without one, nothing is excluded: the caller decides what is deliberate.
+    await server.mcp.tools['get_graph_stats']()
+    assert captured['standalone'] is None
