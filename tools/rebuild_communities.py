@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -31,6 +32,7 @@ DEFAULT_URL = 'http://127.0.0.1:8000/mcp/'
 # Community building runs over every entity in a graph and calls an LLM per
 # cluster; on a large graph tens of minutes is normal, not a hang.
 TIMEOUT_SECONDS = 3600
+MAX_REDIRECTS = 5
 
 
 def log(message: str) -> None:
@@ -45,12 +47,29 @@ def call_tool(url: str, name: str, arguments: dict) -> dict:
         'Accept': 'application/json, text/event-stream',
     }
 
+    # urllib refuses to repeat a POST across a 307, which is exactly what the MCP
+    # endpoint answers when the path is missing its trailing slash — so the call
+    # died on the redirect rather than on anything to do with communities. The
+    # redirect is followed by hand, keeping the method, body and session header,
+    # which is what 307 means in the first place.
+    target = url
+
     def post(body: dict) -> tuple[str, dict]:
-        request = urllib.request.Request(
-            url, data=json.dumps(body).encode(), headers={**headers, **({'Mcp-Session-Id': session_id} if session_id else {})}
-        )
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            return response.read().decode('utf-8', 'replace'), dict(response.headers)
+        nonlocal target
+        for _ in range(MAX_REDIRECTS):
+            request = urllib.request.Request(
+                target,
+                data=json.dumps(body).encode(),
+                headers={**headers, **({'Mcp-Session-Id': session_id} if session_id else {})},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+                    return response.read().decode('utf-8', 'replace'), dict(response.headers)
+            except urllib.error.HTTPError as error:
+                if error.code not in (307, 308) or not error.headers.get('Location'):
+                    raise
+                target = urllib.parse.urljoin(target, error.headers['Location'])
+        raise RuntimeError(f'too many redirects, last was {target}')
 
     # Handshake first: the server assigns a session id that every later call must
     # carry, and rejects tool calls made without one.
