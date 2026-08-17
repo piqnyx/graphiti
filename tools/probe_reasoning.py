@@ -38,13 +38,35 @@ TIMEOUT_SECONDS = 180
 MAX_TOKENS = 8192
 USER_AGENT = os.environ.get('PROBE_USER_AGENT', '').strip() or 'graphiti-reasoning-probe/1'
 
-# A task shaped like the ones extraction actually performs: short input, a
-# mechanical judgement, a one-line structured answer. If reasoning effort matters
-# anywhere, it matters here.
-PROMPT = (
+# Two tasks, because one of them cannot answer the question.
+#
+# The trivial one measures whether a setting is honoured at all: if the baseline
+# answers in six tokens, a setting that raises the count has plainly been read.
+#
+# But a six-token baseline has no reasoning to remove, so on that task a setting
+# that disables reasoning is indistinguishable from one that was ignored. The
+# heavy task is the one that decides: real extraction over a stretch of dialog,
+# where the model does spend thousands of tokens thinking before it answers.
+TRIVIAL_PROMPT = (
     'Two statements: "Вит живёт в Григолети" and "Вит живёт в селе Григолети рядом с Батуми". '
     'Do they describe the same fact? Answer with JSON only: {"same": true or false}.'
 )
+
+EXTRACTION_PROMPT = """You extract a knowledge graph from a conversation.
+
+Conversation:
+Вит: Мы с Олей завели в Йошкар-Оле собаку Басю, жирного английского бульдога.
+Краб: Бульдоги — те ещё лежебоки. Она с вами и в Кишинёв переехала?
+Вит: Нет, при расставании с Олей я отдал Басю в добрые руки. Оля потом улетела в Краснодар.
+Краб: А Камыш? Ты говорил, он твой давний кент.
+Вит: Камыш со школы, мы с ним в Йошке в одном дворе росли. Сейчас он в Москве, работает на стройке.
+Вит: Я сам теперь живу в Григолети под Батуми, в доме на колёсах у моря.
+
+Return JSON only, no prose, in exactly this shape:
+{"entities": [{"name": "...", "type": "person|place|animal|other"}],
+ "facts": [{"subject": "...", "predicate": "...", "object": "...", "valid_now": true}]}
+Include every person, place and animal mentioned, and every relationship stated,
+including ones that are no longer true, marking those valid_now false."""
 
 CANDIDATES: list[tuple[str, dict]] = [
     ('baseline (nothing sent)', {}),
@@ -62,11 +84,11 @@ CANDIDATES: list[tuple[str, dict]] = [
 ]
 
 
-def ask(url: str, key: str, model: str, extra: dict) -> dict:
+def ask(url: str, key: str, model: str, extra: dict, prompt: str) -> dict:
     """Send the probe once and report what came back, without raising."""
     payload = {
         'model': model,
-        'messages': [{'role': 'user', 'content': PROMPT}],
+        'messages': [{'role': 'user', 'content': prompt}],
         'max_tokens': MAX_TOKENS,
         **extra,
     }
@@ -99,7 +121,7 @@ def ask(url: str, key: str, model: str, extra: dict) -> dict:
         'ok': True,
         'output': usage.get('completion_tokens'),
         'reasoning': details.get('reasoning_tokens'),
-        'answer': ' '.join(str(message.get('content') or '').split())[:80],
+        'answer': ' '.join(str(message.get('content') or '').split())[:120],
         'finish': choice.get('finish_reason'),
     }
 
@@ -113,38 +135,40 @@ def main() -> int:
         return 2
 
     print(f'model: {model}')
-    print('sending the same short extraction-shaped task with each candidate setting\n')
 
-    baseline: int | None = None
-    rows: list[tuple[str, str]] = []
-    for label, extra in CANDIDATES:
-        result = ask(url, key, model, extra)
-        if not result['ok']:
-            rows.append((label, f'rejected — {result["why"]}'))
-            print(f'  {label}: rejected')
-            continue
+    for task, prompt in (('trivial judgement', TRIVIAL_PROMPT), ('real extraction', EXTRACTION_PROMPT)):
+        print(f'\n=== {task} ===')
+        baseline: int | None = None
+        rows: list[tuple[str, str]] = []
+        for label, extra in CANDIDATES:
+            result = ask(url, key, model, extra, prompt)
+            if not result['ok']:
+                rows.append((label, f'rejected — {result["why"]}'))
+                print(f'  {label}: rejected')
+                continue
 
-        output = result['output']
-        if baseline is None and not extra:
-            baseline = output
-        change = ''
-        if baseline and isinstance(output, int) and baseline > 0:
-            delta = round((output - baseline) / baseline * 100)
-            change = f' ({delta:+d}% vs baseline)'
-        reasoning = f', reasoning {result["reasoning"]}' if result['reasoning'] is not None else ''
-        rows.append((label, f'accepted, output {output}{reasoning}{change}, finish={result["finish"]}'))
-        print(f'  {label}: output {output}{reasoning}{change}')
+            output = result['output']
+            if baseline is None and not extra:
+                baseline = output
+            change = ''
+            if baseline and isinstance(output, int) and baseline > 0:
+                delta = round((output - baseline) / baseline * 100)
+                change = f' ({delta:+d}% vs baseline)'
+            reasoning = f', reasoning {result["reasoning"]}' if result['reasoning'] is not None else ''
+            rows.append((label, f'output {output}{reasoning}{change}, finish={result["finish"]}'))
+            print(f'  {label}: output {output}{reasoning}{change}')
+
+        print('  ' + '-' * 70)
+        for label, outcome in rows:
+            print(f'  {label:44} {outcome}')
 
     print()
-    print('=' * 72)
-    for label, outcome in rows:
-        print(f'{label:44} {outcome}')
-    print('=' * 72)
-    print()
-    print('How to read this. "rejected" means the provider refuses the field: unusable.')
-    print('"accepted" with an output count close to the baseline means it was taken and')
-    print('ignored — which is worse than rejection, because it looks like it worked.')
-    print('A clearly lower output count is the one setting worth wiring into the client.')
+    print('How to read this. The trivial task says whether a setting is read at all:')
+    print('a baseline of a few tokens leaves nothing to remove, so a setting that')
+    print('disables reasoning looks exactly like one that was ignored. The extraction')
+    print('task is the one that decides, because the model does think there. A setting')
+    print('worth wiring in is one that cuts output on extraction without wrecking the')
+    print('answer — so read the JSON in the last column too, not only the numbers.')
     return 0
 
 
