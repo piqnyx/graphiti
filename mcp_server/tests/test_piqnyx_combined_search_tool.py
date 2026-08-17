@@ -28,9 +28,10 @@ class FakeDriver:
         return FakeDriver(database)
 
 
-def edge(uuid, fact, episodes, invalid_at=None):
+def edge(uuid, fact, episodes, invalid_at=None, source='n1', target='n2'):
     return SimpleNamespace(
         uuid=uuid, fact=fact, episodes=episodes,
+        source_node_uuid=source, target_node_uuid=target,
         created_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
         valid_at=None, invalid_at=invalid_at, expired_at=None,
     )
@@ -91,6 +92,9 @@ async def test_scores_reach_the_caller_and_the_search_is_scoped():
     assert out['facts'][0]['score'] == 0.54
     assert out['facts'][0]['episodes'] == ['ep-1', 'ep-9']
     assert out['entities'][0]['score'] == 0.48
+    # An entity has no provenance of its own; the facts touching it name the
+    # conversations it came up in, so their endpoints must survive the trip.
+    assert out['facts'][0]['source_node_uuid'] == 'n1'
     assert out['episodes'][0]['name'] == '8248439450-9'
     # Isolation: the search runs against the agent's own physical graph.
     assert client.calls[0]['driver'].database == 'main'

@@ -116,6 +116,12 @@ def install_search_memory_combined_tool(server: Any) -> None:
                     'fact': edge.fact,
                     'score': score,
                     'episodes': list(getattr(edge, 'episodes', []) or []),
+                    # The two entities this fact connects. An entity carries no
+                    # provenance of its own, so this is the only honest way to say
+                    # which conversations it came up in: the episodes of the facts
+                    # that touch it.
+                    'source_node_uuid': getattr(edge, 'source_node_uuid', None),
+                    'target_node_uuid': getattr(edge, 'target_node_uuid', None),
                     'created_at': _iso(getattr(edge, 'created_at', None)),
                     'valid_at': _iso(getattr(edge, 'valid_at', None)),
                     'invalid_at': _iso(getattr(edge, 'invalid_at', None)),
