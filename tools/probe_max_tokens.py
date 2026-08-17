@@ -35,6 +35,12 @@ import urllib.request
 LOWEST = 1024
 CEILING = 1 << 21  # 2097152; far above any current model, so it bounds the search
 TIMEOUT_SECONDS = 30
+# urllib announces itself as Python-urllib, which Cloudflare's browser integrity
+# check rejects outright with 403/1010 — before the request reaches the model, so
+# the answer would be about the CDN rather than the ceiling. The real client does
+# not hit this because httpx sends its own agent. Override with PROBE_USER_AGENT
+# if a provider wants something else.
+USER_AGENT = os.environ.get('PROBE_USER_AGENT', '').strip() or 'graphiti-max-tokens-probe/1 (httpx-compatible)'
 
 
 def accepts(url: str, key: str, model: str, max_tokens: int) -> tuple[bool, str]:
@@ -49,7 +55,12 @@ def accepts(url: str, key: str, model: str, max_tokens: int) -> tuple[bool, str]
     request = urllib.request.Request(
         url.rstrip('/') + '/chat/completions',
         data=payload,
-        headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+        headers={
+            'Authorization': f'Bearer {key}',
+            'Content-Type': 'application/json',
+            'User-Agent': USER_AGENT,
+            'Accept': 'application/json',
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
