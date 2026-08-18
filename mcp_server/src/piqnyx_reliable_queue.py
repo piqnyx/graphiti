@@ -6,7 +6,8 @@ place with capped exponential backoff and later episodes never leapfrog it.
 
 There is deliberately no terminal "blocked" state holding the only copy of a task
 in RAM. If this process restarts, the caller notices that its episode is absent and
-resubmits the same durable queue head.
+resubmits the same durable queue head. Repeated submissions of an episode UUID that
+is already active or queued are acknowledged without enqueuing a second execution.
 """
 
 import asyncio
@@ -129,21 +130,9 @@ class ReliableQueueService(_BaseQueueService):
         finally:
             self._enqueue_metadata.reset(token)
 
-    async def add_episode_task(
-        self, group_id: str, process_func: Callable[[], Awaitable[None]]
-    ) -> int:
-        metadata = self._enqueue_metadata.get()
-        if metadata is not None:
-            self._task_metadata[id(process_func)] = dict(metadata)
-        try:
-            return await super().add_episode_task(group_id, process_func)
-        except Exception:
-            self._task_metadata.pop(id(process_func), None)
-            raise
-
-    def is_group_blocked(self, group_id: str) -> bool:  # noqa: ARG002
-        """There is no terminal block state; a failing head remains the active head."""
-        return False
+    def _metadata_for_current(self, group_id: str) -> dict[str, Any]:
+        process_func = self._current_task.get(group_id)
+        return self._task_metadata.get(id(process_func), {}) if process_func else {}
 
     def _queued_episode_uuids(self, group_id: str) -> list[str]:
         queue = self._episode_queues.get(group_id)
@@ -161,9 +150,45 @@ class ReliableQueueService(_BaseQueueService):
                 result.append(episode_uuid)
         return result
 
+    async def add_episode_task(
+        self, group_id: str, process_func: Callable[[], Awaitable[None]]
+    ) -> int:
+        metadata = self._enqueue_metadata.get()
+        episode_uuid = metadata.get('episode_uuid') if metadata is not None else None
+
+        # Caller retries are expected after lost HTTP/MCP responses and server
+        # reconnects. Never turn that into two expensive Graphiti executions.
+        if isinstance(episode_uuid, str) and episode_uuid:
+            if self._metadata_for_current(group_id).get('episode_uuid') == episode_uuid:
+                logger.info(
+                    'Ignoring duplicate submission already processing group_id=%s episode_uuid=%s',
+                    group_id,
+                    episode_uuid,
+                )
+                return 0
+            queued_uuids = self._queued_episode_uuids(group_id)
+            if episode_uuid in queued_uuids:
+                logger.info(
+                    'Ignoring duplicate submission already queued group_id=%s episode_uuid=%s',
+                    group_id,
+                    episode_uuid,
+                )
+                return queued_uuids.index(episode_uuid) + 1
+
+        if metadata is not None:
+            self._task_metadata[id(process_func)] = dict(metadata)
+        try:
+            return await super().add_episode_task(group_id, process_func)
+        except Exception:
+            self._task_metadata.pop(id(process_func), None)
+            raise
+
+    def is_group_blocked(self, group_id: str) -> bool:  # noqa: ARG002
+        """There is no terminal block state; a failing head remains the active head."""
+        return False
+
     def get_failure_status(self, group_id: str) -> dict[str, Any]:
-        process_func = self._current_task.get(group_id)
-        metadata = self._task_metadata.get(id(process_func), {}) if process_func else {}
+        metadata = self._metadata_for_current(group_id)
         return {
             'group_id': group_id,
             'blocked': False,
@@ -196,29 +221,29 @@ class ReliableQueueService(_BaseQueueService):
                     while True:
                         try:
                             await process_func()
-                            attempts = self._current_attempts.get(group_id, 0)
-                            if attempts > 0:
+                            failures = self._current_attempts.get(group_id, 0)
+                            if failures > 0:
                                 logger.info(
                                     'Episode processing recovered for group_id=%s '
                                     'episode_uuid=%s after_failures=%d',
                                     group_id,
                                     metadata.get('episode_uuid'),
-                                    attempts,
+                                    failures,
                                 )
                             break
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
-                            attempts = self._current_attempts.get(group_id, 0) + 1
-                            self._current_attempts[group_id] = attempts
+                            failures = self._current_attempts.get(group_id, 0) + 1
+                            self._current_attempts[group_id] = failures
                             self._current_errors[group_id] = str(exc)
-                            delay = self._retry_delay(attempts)
+                            delay = self._retry_delay(failures)
                             logger.warning(
                                 'Episode processing failed for group_id=%s episode_uuid=%s '
                                 'attempt=%d retry_in=%.3fs error=%s',
                                 group_id,
                                 metadata.get('episode_uuid'),
-                                attempts,
+                                failures,
                                 delay,
                                 str(exc),
                             )
