@@ -21,7 +21,7 @@ import re
 import threading
 import typing
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -71,6 +71,16 @@ def _trace_value(value: Any) -> Any:
         return str(value)
 
 
+def _completion_tokens(usage: Any) -> int | None:
+    """Return provider-reported completion tokens without assuming an SDK shape."""
+    if usage is None:
+        return None
+    value = usage.get('completion_tokens') if isinstance(usage, dict) else getattr(
+        usage, 'completion_tokens', None
+    )
+    return value if isinstance(value, int) and value >= 0 else None
+
+
 def _trace_llm_event(event: dict[str, Any]) -> None:
     """Append an opt-in JSONL event containing the real LLM request or response.
 
@@ -83,7 +93,7 @@ def _trace_llm_event(event: dict[str, Any]) -> None:
     if not path:
         return
 
-    record = {'timestamp': datetime.now(UTC).isoformat(), **event}
+    record = {'timestamp': datetime.now(timezone.utc).isoformat(), **event}
     try:
         directory = os.path.dirname(path)
         if directory:
@@ -94,6 +104,11 @@ def _trace_llm_event(event: dict[str, Any]) -> None:
                 trace_file.write(line)
                 trace_file.write('\n')
                 trace_file.flush()
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                # Permissions are best-effort diagnostics, never ingestion state.
+                pass
     except Exception as exc:  # noqa: BLE001 - diagnostics must never break ingestion
         logger.warning('Failed to write GRAPHITI_LLM_TRACE_FILE: %s', exc)
 
@@ -249,36 +264,56 @@ class OpenAIGenericClient(LLMClient):
             choice = response.choices[0]
             result = choice.message.content or ''
             finish_reason = getattr(choice, 'finish_reason', None)
+            usage = getattr(response, 'usage', None)
+            completion_tokens = _completion_tokens(usage)
             _trace_llm_event(
                 {
                     'event': 'response',
                     'request_id': request_id,
                     **trace_context,
                     'finish_reason': finish_reason,
-                    'usage': _trace_value(getattr(response, 'usage', None)),
+                    'usage': _trace_value(usage),
                     'content_chars': len(result),
                     # Preserve the exact body before fences are stripped or JSON is parsed.
                     'content': result,
                 }
             )
 
-            # An explicit length stop is deterministic for an unchanged request and
-            # budget. Do not let the generic JSON retry wrapper spend that budget four
-            # more times before the durable outer episode queue backs off.
+            # Explicit length is definitive. Some OpenAI-compatible gateways have also
+            # been observed to report stop/empty content while billing exactly the entire
+            # completion budget to hidden reasoning. Treat that as the same failure when
+            # the body is absent or cannot be parsed below.
+            budget_exhausted = completion_tokens is not None and completion_tokens >= max_tokens
             if finish_reason == 'length':
                 raise OutputLimitError(
-                    f'LLM output limit reached (max_tokens={max_tokens}, content_chars={len(result)})'
+                    f'LLM output limit reached (max_tokens={max_tokens}, completion_tokens={completion_tokens}, content_chars={len(result)})'
                 )
 
-            # An empty body (refusal or a flaky endpoint) would make json.loads raise a
-            # cryptic JSONDecodeError; surface a clear error instead.
             if not result:
+                if budget_exhausted:
+                    raise OutputLimitError(
+                        f'LLM completion budget exhausted before content (max_tokens={max_tokens}, completion_tokens={completion_tokens})'
+                    )
                 raise EmptyResponseError('LLM returned an empty response')
-            # Many OpenAI-compatible/local models wrap JSON in a ```json fence even under a
-            # structured response_format; strip it before json.loads.
-            parsed = json.loads(self._strip_code_fences(result))
+
+            try:
+                parsed = json.loads(self._strip_code_fences(result))
+            except json.JSONDecodeError as exc:
+                if budget_exhausted:
+                    raise OutputLimitError(
+                        f'LLM completion budget exhausted with malformed JSON (max_tokens={max_tokens}, completion_tokens={completion_tokens}, content_chars={len(result)})'
+                    ) from exc
+                raise
+
             if response_model is not None:
-                return response_model.model_validate(parsed).model_dump()
+                try:
+                    return response_model.model_validate(parsed).model_dump()
+                except Exception as exc:
+                    if budget_exhausted:
+                        raise OutputLimitError(
+                            f'LLM completion budget exhausted with incomplete structured output (max_tokens={max_tokens}, completion_tokens={completion_tokens}, content_chars={len(result)})'
+                        ) from exc
+                    raise
             return parsed
         except openai.RateLimitError as e:
             _trace_llm_event(
