@@ -103,6 +103,8 @@ async def test_status_exposes_active_identity_and_pending_uuid_without_content()
         'blocked': False,
         'attempts': 0,
         'last_error': None,
+        'failure_kind': None,
+        'retry_in_seconds': None,
         'pending': 1,
         'worker_running': True,
         'episode_uuid': 'episode-1',
@@ -196,6 +198,36 @@ async def test_failures_are_isolated_per_group():
 
     release_main = True
     await _wait_until(lambda: service.get_failure_status('main')['episode_uuid'] is None)
+
+
+def test_retry_policy_distinguishes_expensive_and_transient_failures():
+    service = ReliableQueueService(
+        retry_base_seconds=2,
+        retry_max_seconds=3600,
+    )
+
+    OutputLimitError = type('OutputLimitError', (RuntimeError,), {})
+    RateLimitError = type('RateLimitError', (RuntimeError,), {})
+    APIConnectionError = type('APIConnectionError', (RuntimeError,), {})
+
+    assert service._retry_delay(1, OutputLimitError('budget exhausted')) == (
+        'output_limit',
+        300.0,
+    )
+    assert service._retry_delay(1, RateLimitError('rate limit')) == ('rate_limit', 30.0)
+    assert service._retry_delay(1, APIConnectionError('connection reset')) == (
+        'provider_unavailable',
+        10.0,
+    )
+
+    payment_error = RuntimeError('402 payment required: insufficient balance')
+    payment_error.status_code = 402  # type: ignore[attr-defined]
+    assert service._retry_delay(1, payment_error) == ('credentials_or_balance', 300.0)
+
+    # Ordinary bugs still back off exponentially rather than being treated as a
+    # provider outage. They are retained by the durable caller exactly the same way.
+    assert service._retry_delay(1, RuntimeError('boom')) == ('unexpected', 2.0)
+    assert service._retry_delay(5, RuntimeError('boom')) == ('unexpected', 32.0)
 
 
 def test_retry_configuration_validation_and_legacy_attempt_limit_is_ignored():
