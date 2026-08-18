@@ -346,6 +346,10 @@ class ReliableQueueService(_BaseQueueService):
                             )
                             if delay > 0:
                                 await asyncio.sleep(delay)
+                            else:
+                                # Zero is valid for tests/diagnostics. Still yield so a
+                                # failing coroutine cannot monopolise the event loop.
+                                await asyncio.sleep(0)
                             self._current_retry_at.pop(group_id, None)
                 finally:
                     self._task_metadata.pop(id(process_func), None)
