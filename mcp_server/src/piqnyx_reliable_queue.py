@@ -1,8 +1,12 @@
-"""piqnyx reliable per-group episode queue overlay.
+"""piqnyx sequential per-group episode executor.
 
-This layer retries the current episode in place and blocks only that group after
-terminal failure. Pending episodes are never allowed to leapfrog a failed
-predecessor.
+Durability belongs to the caller-side spool. This server queue has one job: execute
+accepted work in FIFO order while the process is alive. A failed head is retried in
+place with capped exponential backoff and later episodes never leapfrog it.
+
+There is deliberately no terminal "blocked" state holding the only copy of a task
+in RAM. If this process restarts, the caller notices that its episode is absent and
+resubmits the same durable queue head.
 """
 
 import asyncio
@@ -20,32 +24,27 @@ logger = logging.getLogger(__name__)
 _BaseQueueService = queue_module.QueueService
 _installed = False
 
-DEFAULT_PROCESS_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_BASE_SECONDS = 2.0
-DEFAULT_RETRY_MAX_SECONDS = 30.0
+DEFAULT_RETRY_MAX_SECONDS = 3600.0
 
 
 class EpisodeQueueBlockedError(RuntimeError):
-    """Raised when a group is blocked behind a terminally failed episode."""
+    """Compatibility alias retained for callers compiled against the old overlay."""
 
 
 class ReliableQueueService(_BaseQueueService):
-    """QueueService with retry-in-place and stop-on-terminal-failure semantics."""
+    """FIFO queue that retries the current head until it succeeds or the process stops."""
 
     def __init__(
         self,
         max_size_per_group: int | None = None,
-        process_max_attempts: int | None = None,
+        process_max_attempts: int | None = None,  # kept for config compatibility; ignored
         retry_base_seconds: float | None = None,
         retry_max_seconds: float | None = None,
     ):
         super().__init__(max_size_per_group=max_size_per_group)
+        del process_max_attempts
 
-        self._process_max_attempts = self._read_positive_int(
-            process_max_attempts,
-            'EPISODE_PROCESS_MAX_ATTEMPTS',
-            DEFAULT_PROCESS_MAX_ATTEMPTS,
-        )
         self._retry_base_seconds = self._read_nonnegative_float(
             retry_base_seconds,
             'EPISODE_PROCESS_RETRY_BASE_SECONDS',
@@ -62,25 +61,13 @@ class ReliableQueueService(_BaseQueueService):
                 'EPISODE_PROCESS_RETRY_BASE_SECONDS'
             )
 
-        self._blocked_groups: dict[str, str] = {}
-        self._failed_tasks: dict[str, Callable[[], Awaitable[None]]] = {}
-        self._failed_attempts: dict[str, int] = {}
-        self._failed_metadata: dict[str, dict[str, Any]] = {}
         self._task_metadata: dict[int, dict[str, Any]] = {}
         self._enqueue_metadata: ContextVar[dict[str, Any] | None] = ContextVar(
             f'piqnyx_queue_metadata_{id(self)}', default=None
         )
-
-    @staticmethod
-    def _read_positive_int(value: int | None, env_name: str, default: int) -> int:
-        raw: Any = value if value is not None else os.getenv(env_name, str(default))
-        try:
-            parsed = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f'{env_name} must be a positive integer') from exc
-        if parsed <= 0:
-            raise ValueError(f'{env_name} must be a positive integer')
-        return parsed
+        self._current_task: dict[str, Callable[[], Awaitable[None]]] = {}
+        self._current_attempts: dict[str, int] = {}
+        self._current_errors: dict[str, str] = {}
 
     @staticmethod
     def _read_nonnegative_float(value: float | None, env_name: str, default: float) -> float:
@@ -112,7 +99,7 @@ class ReliableQueueService(_BaseQueueService):
         saga: str | None = None,
         saga_previous_episode_uuid: str | None = None,
     ) -> int:
-        """Attach safe episode identity metadata while preserving upstream enqueue behavior."""
+        """Attach identity metadata while preserving the ordinary enqueue path."""
         token = self._enqueue_metadata.set(
             {
                 'episode_uuid': uuid,
@@ -145,13 +132,6 @@ class ReliableQueueService(_BaseQueueService):
     async def add_episode_task(
         self, group_id: str, process_func: Callable[[], Awaitable[None]]
     ) -> int:
-        if self.is_group_blocked(group_id):
-            last_error = self._blocked_groups[group_id]
-            raise EpisodeQueueBlockedError(
-                f"episode queue for group '{group_id}' is blocked by a failed predecessor: "
-                f'{last_error}'
-            )
-
         metadata = self._enqueue_metadata.get()
         if metadata is not None:
             self._task_metadata[id(process_func)] = dict(metadata)
@@ -161,111 +141,95 @@ class ReliableQueueService(_BaseQueueService):
             self._task_metadata.pop(id(process_func), None)
             raise
 
-    def is_group_blocked(self, group_id: str) -> bool:
-        return group_id in self._blocked_groups
+    def is_group_blocked(self, group_id: str) -> bool:  # noqa: ARG002
+        """There is no terminal block state; a failing head remains the active head."""
+        return False
+
+    def _queued_episode_uuids(self, group_id: str) -> list[str]:
+        queue = self._episode_queues.get(group_id)
+        if queue is None:
+            return []
+        # asyncio.Queue intentionally exposes no iterator. Reading its deque here is
+        # safe because this method is synchronous on the same event-loop thread and
+        # is diagnostics only; it never mutates the queue.
+        queued = getattr(queue, '_queue', ())
+        result: list[str] = []
+        for process_func in list(queued):
+            metadata = self._task_metadata.get(id(process_func), {})
+            episode_uuid = metadata.get('episode_uuid')
+            if isinstance(episode_uuid, str) and episode_uuid:
+                result.append(episode_uuid)
+        return result
 
     def get_failure_status(self, group_id: str) -> dict[str, Any]:
-        metadata = self._failed_metadata.get(group_id, {})
+        process_func = self._current_task.get(group_id)
+        metadata = self._task_metadata.get(id(process_func), {}) if process_func else {}
         return {
             'group_id': group_id,
-            'blocked': self.is_group_blocked(group_id),
-            'attempts': self._failed_attempts.get(group_id, 0),
-            'last_error': self._blocked_groups.get(group_id),
+            'blocked': False,
+            'attempts': self._current_attempts.get(group_id, 0),
+            'last_error': self._current_errors.get(group_id),
             'pending': self.get_queue_size(group_id),
+            'worker_running': self.is_worker_running(group_id),
             'episode_uuid': metadata.get('episode_uuid'),
             'episode_name': metadata.get('episode_name'),
             'saga': metadata.get('saga'),
+            'queued_episode_uuids': self._queued_episode_uuids(group_id),
         }
 
     def _retry_delay(self, failed_attempt_number: int) -> float:
         delay = self._retry_base_seconds * (2 ** max(failed_attempt_number - 1, 0))
         return min(delay, self._retry_max_seconds)
 
-    async def _run_with_retries(
-        self,
-        group_id: str,
-        process_func: Callable[[], Awaitable[None]],
-    ) -> tuple[bool, Exception | None, int]:
-        last_error: Exception | None = None
-
-        for attempt in range(1, self._process_max_attempts + 1):
-            try:
-                await process_func()
-                if attempt > 1:
-                    logger.info(
-                        'Episode processing recovered for group_id=%s on attempt=%d',
-                        group_id,
-                        attempt,
-                    )
-                return True, None, attempt
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                last_error = exc
-                logger.warning(
-                    'Episode processing failed for group_id=%s attempt=%d/%d: %s',
-                    group_id,
-                    attempt,
-                    self._process_max_attempts,
-                    str(exc),
-                )
-
-                if attempt < self._process_max_attempts:
-                    delay = self._retry_delay(attempt)
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-
-        return False, last_error, self._process_max_attempts
-
-    async def _process_episode_queue(
-        self,
-        group_id: str,
-        initial_task: Callable[[], Awaitable[None]] | None = None,
-    ) -> None:
+    async def _process_episode_queue(self, group_id: str) -> None:
         logger.info('Starting reliable episode queue worker for group_id: %s', group_id)
-        initial = initial_task
 
         try:
             while True:
-                from_queue = initial is None
-                process_func = (
-                    await self._episode_queues[group_id].get() if from_queue else initial
-                )
-                initial = None
+                process_func = await self._episode_queues[group_id].get()
+                self._current_task[group_id] = process_func
+                self._current_attempts[group_id] = 0
+                self._current_errors.pop(group_id, None)
+                metadata = self._task_metadata.get(id(process_func), {})
 
                 try:
-                    success, last_error, attempts = await self._run_with_retries(
-                        group_id, process_func
-                    )
-
-                    if success:
-                        self._task_metadata.pop(id(process_func), None)
-                        self._blocked_groups.pop(group_id, None)
-                        self._failed_tasks.pop(group_id, None)
-                        self._failed_attempts.pop(group_id, None)
-                        self._failed_metadata.pop(group_id, None)
-                        continue
-
-                    error_text = str(last_error) if last_error is not None else 'unknown error'
-                    self._blocked_groups[group_id] = error_text
-                    self._failed_tasks[group_id] = process_func
-                    self._failed_attempts[group_id] = attempts
-                    self._failed_metadata[group_id] = dict(
-                        self._task_metadata.get(id(process_func), {})
-                    )
-                    logger.error(
-                        'Blocking episode queue for group_id=%s after %d failed attempts; '
-                        'pending=%d episode_uuid=%s error=%s',
-                        group_id,
-                        attempts,
-                        self.get_queue_size(group_id),
-                        self._failed_metadata[group_id].get('episode_uuid'),
-                        error_text,
-                    )
-                    return
+                    while True:
+                        try:
+                            await process_func()
+                            attempts = self._current_attempts.get(group_id, 0)
+                            if attempts > 0:
+                                logger.info(
+                                    'Episode processing recovered for group_id=%s '
+                                    'episode_uuid=%s after_failures=%d',
+                                    group_id,
+                                    metadata.get('episode_uuid'),
+                                    attempts,
+                                )
+                            break
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            attempts = self._current_attempts.get(group_id, 0) + 1
+                            self._current_attempts[group_id] = attempts
+                            self._current_errors[group_id] = str(exc)
+                            delay = self._retry_delay(attempts)
+                            logger.warning(
+                                'Episode processing failed for group_id=%s episode_uuid=%s '
+                                'attempt=%d retry_in=%.3fs error=%s',
+                                group_id,
+                                metadata.get('episode_uuid'),
+                                attempts,
+                                delay,
+                                str(exc),
+                            )
+                            if delay > 0:
+                                await asyncio.sleep(delay)
                 finally:
-                    if from_queue:
-                        self._episode_queues[group_id].task_done()
+                    self._task_metadata.pop(id(process_func), None)
+                    self._current_task.pop(group_id, None)
+                    self._current_attempts.pop(group_id, None)
+                    self._current_errors.pop(group_id, None)
+                    self._episode_queues[group_id].task_done()
         except asyncio.CancelledError:
             logger.info('Episode queue worker for group_id %s was cancelled', group_id)
         except Exception as exc:
@@ -276,33 +240,10 @@ class ReliableQueueService(_BaseQueueService):
             )
         finally:
             self._queue_workers[group_id] = False
+            self._current_task.pop(group_id, None)
+            self._current_attempts.pop(group_id, None)
+            self._current_errors.pop(group_id, None)
             logger.info('Stopped reliable episode queue worker for group_id: %s', group_id)
-
-    async def retry_blocked_group(self, group_id: str) -> bool:
-        """Retry the failed predecessor before any already-pending episodes."""
-        process_func = self._failed_tasks.get(group_id)
-        if process_func is None or not self.is_group_blocked(group_id):
-            return False
-        if self._queue_workers.get(group_id, False):
-            return False
-
-        self._blocked_groups.pop(group_id, None)
-        self._failed_tasks.pop(group_id, None)
-        self._failed_attempts.pop(group_id, None)
-        self._failed_metadata.pop(group_id, None)
-
-        self._queue_workers[group_id] = True
-        try:
-            asyncio.create_task(self._process_episode_queue(group_id, initial_task=process_func))
-        except Exception:
-            self._queue_workers[group_id] = False
-            self._blocked_groups[group_id] = 'failed to schedule retry worker'
-            self._failed_tasks[group_id] = process_func
-            self._failed_metadata[group_id] = dict(
-                self._task_metadata.get(id(process_func), {})
-            )
-            raise
-        return True
 
 
 def install_reliable_queue_patch() -> None:
