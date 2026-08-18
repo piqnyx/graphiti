@@ -18,8 +18,12 @@ import json
 import logging
 import os
 import re
+import threading
 import typing
+from contextvars import ContextVar
+from datetime import UTC, datetime
 from typing import Any, Literal
+from uuid import uuid4
 
 import openai
 from openai import AsyncOpenAI
@@ -33,25 +37,66 @@ from .errors import EmptyResponseError, RateLimitError
 
 logger = logging.getLogger(__name__)
 
+_TRACE_LOCK = threading.Lock()
+_TRACE_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    'graphiti_openai_generic_trace_context', default=None
+)
+
 
 def _reasoning_kwargs() -> dict[str, Any]:
     """Reasoning effort for this request, if the deployment asked for one.
 
-    Observed against deepseek-v4-flash through opencode.ai: a 4,000-token
-    extraction request returned exactly 65,536 output tokens, repeatedly and
-    stably — the whole budget spent before any JSON was emitted, so nothing ever
-    parsed and no episode was ever stored. Reasoning tokens count towards that
-    budget, which makes turning them down the one lever that addresses the cause
-    rather than the symptom.
-
-    Read from the environment rather than the config schema so it can be changed
-    or removed by editing one line of the env file and restarting, with no
-    rebuild — this is a setting that has to be tried against a live backend, and
-    measurements so far say the safe value is not obvious. Unset sends nothing at
-    all, which is exactly the behaviour before this existed.
+    This is intentionally an environment switch because OpenAI-compatible gateways
+    differ in which reasoning values they accept. The exact request/response trace
+    can be enabled separately to verify what was actually sent and what the gateway
+    returned instead of inferring provider behaviour from token totals.
     """
     effort = os.environ.get('GRAPHITI_REASONING_EFFORT', '').strip()
     return {'reasoning_effort': effort} if effort else {}
+
+
+def _trace_value(value: Any) -> Any:
+    """Convert SDK response objects to JSON-compatible diagnostic values."""
+    if value is None or isinstance(value, (str, int, float, bool, list, dict)):
+        return value
+    model_dump = getattr(value, 'model_dump', None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode='json')
+        except TypeError:
+            return model_dump()
+    try:
+        return vars(value)
+    except TypeError:
+        return str(value)
+
+
+def _trace_llm_event(event: dict[str, Any]) -> None:
+    """Append an opt-in JSONL event containing the real LLM request or response.
+
+    Set GRAPHITI_LLM_TRACE_FILE to a writable path to enable it. Conversation text
+    and raw model output are intentionally included because this trace exists to
+    reproduce malformed extraction calls. API credentials are never included.
+    Trace I/O is best-effort and must never break ingestion.
+    """
+    path = os.environ.get('GRAPHITI_LLM_TRACE_FILE', '').strip()
+    if not path:
+        return
+
+    record = {'timestamp': datetime.now(UTC).isoformat(), **event}
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, default=str, separators=(',', ':'))
+        with _TRACE_LOCK:
+            with open(path, 'a', encoding='utf-8') as trace_file:
+                trace_file.write(line)
+                trace_file.write('\n')
+                trace_file.flush()
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never break ingestion
+        logger.warning('Failed to write GRAPHITI_LLM_TRACE_FILE: %s', exc)
+
 
 DEFAULT_MODEL = 'gpt-4.1-mini'
 
@@ -148,9 +193,9 @@ class OpenAIGenericClient(LLMClient):
     def _strip_code_fences(text: str) -> str:
         """Strip a wrapping markdown code fence from a JSON payload.
 
-        OpenAI-compatible models served via Ollama/llama.cpp etc. frequently wrap their
-        output in a ```json … ``` fence even when a json_schema/json_object response_format
-        is requested, which breaks a bare ``json.loads``. No-op when there is no fence.
+        OpenAI-compatible models served via Ollama/llama.cpp etc. frequently wrap JSON in a
+        ```json … ``` fence even when a json_schema/json_object response_format is requested,
+        which breaks a bare ``json.loads``. No-op when there is no fence.
         """
         stripped = text.strip()
         if stripped.startswith('```'):
@@ -172,29 +217,79 @@ class OpenAIGenericClient(LLMClient):
                 openai_messages.append({'role': 'user', 'content': m.content})
             elif m.role == 'system':
                 openai_messages.append({'role': 'system', 'content': m.content})
+
+        request_id = uuid4().hex
+        request_kwargs: dict[str, Any] = {
+            'model': self.model or DEFAULT_MODEL,
+            'messages': openai_messages,
+            'temperature': self.temperature,
+            'max_tokens': max_tokens,
+            'response_format': self._build_response_format(response_model),
+            **_reasoning_kwargs(),
+        }
+        trace_context = _TRACE_CONTEXT.get() or {}
+        _trace_llm_event(
+            {
+                'event': 'request',
+                'request_id': request_id,
+                'base_url': str(getattr(self.client, 'base_url', '')),
+                'structured_output_mode': self.structured_output_mode,
+                'response_model': getattr(response_model, '__name__', None),
+                **trace_context,
+                # This exact dict is expanded into create() below. The trace is
+                # therefore the request, not a separately reconstructed approximation.
+                'request': request_kwargs,
+            }
+        )
+
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model or DEFAULT_MODEL,
-                messages=openai_messages,
-                temperature=self.temperature,
-                max_tokens=max_tokens,
-                response_format=self._build_response_format(response_model),  # type: ignore[arg-type]
-                **_reasoning_kwargs(),
+            response = await self.client.chat.completions.create(**request_kwargs)
+            choice = response.choices[0]
+            result = choice.message.content or ''
+            _trace_llm_event(
+                {
+                    'event': 'response',
+                    'request_id': request_id,
+                    **trace_context,
+                    'finish_reason': getattr(choice, 'finish_reason', None),
+                    'usage': _trace_value(getattr(response, 'usage', None)),
+                    'content_chars': len(result),
+                    # Preserve the exact body before fences are stripped or JSON is parsed.
+                    'content': result,
+                }
             )
-            result = response.choices[0].message.content or ''
+
             # An empty body (refusal, length finish_reason, or a flaky endpoint) would make
             # json.loads raise a cryptic JSONDecodeError; surface a clear error instead.
             if not result:
                 raise EmptyResponseError('LLM returned an empty response')
             # Many OpenAI-compatible/local models wrap JSON in a ```json fence even under a
-            # structured response_format; strip it before parsing.
+            # structured response_format; strip it before json.loads.
             parsed = json.loads(self._strip_code_fences(result))
             if response_model is not None:
                 return response_model.model_validate(parsed).model_dump()
             return parsed
         except openai.RateLimitError as e:
+            _trace_llm_event(
+                {
+                    'event': 'error',
+                    'request_id': request_id,
+                    **trace_context,
+                    'error_type': type(e).__name__,
+                    'error': str(e),
+                }
+            )
             raise RateLimitError from e
         except Exception as e:
+            _trace_llm_event(
+                {
+                    'event': 'error',
+                    'request_id': request_id,
+                    **trace_context,
+                    'error_type': type(e).__name__,
+                    'error': str(e),
+                }
+            )
             logger.error(f'Error in generating LLM response: {e}')
             raise
 
@@ -218,9 +313,7 @@ class OpenAIGenericClient(LLMClient):
         # response_format, so no prompt injection is needed.
         if response_model is not None and self.structured_output_mode == 'json_object':
             serialized_model = json.dumps(response_model.model_json_schema())
-            messages[
-                -1
-            ].content += (
+            messages[-1].content += (
                 f'\n\nRespond with a JSON object in the following format:\n\n{serialized_model}'
             )
 
@@ -238,12 +331,18 @@ class OpenAIGenericClient(LLMClient):
                 attributes['prompt.name'] = prompt_name
             span.add_attributes(attributes)
 
+            token = _TRACE_CONTEXT.set(
+                {
+                    'prompt_name': prompt_name,
+                    'group_id': group_id,
+                    'model_size': model_size.value,
+                }
+            )
             try:
                 # Delegate to the base tenacity wrapper so transient JSONDecodeError /
-                # RateLimitError get backoff-retried (4 attempts) — most relevant in the
-                # json_object fallback path for less-reliable providers. This is the clean
-                # retry mechanism (same pattern as Gliner2Client); the old hand-rolled
-                # re-prompt loop is intentionally not reinstated.
+                # RateLimitError get backoff-retried (4 attempts). Every attempt receives
+                # its own request_id in the exact trace, so retries are visible instead of
+                # looking like one mysterious oversized provider call.
                 return await self._generate_response_with_retry(
                     messages, response_model, max_tokens=max_tokens, model_size=model_size
                 )
@@ -251,3 +350,5 @@ class OpenAIGenericClient(LLMClient):
                 span.set_status('error', str(e))
                 span.record_exception(e)
                 raise
+            finally:
+                _TRACE_CONTEXT.reset(token)
