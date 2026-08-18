@@ -8,7 +8,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from piqnyx_reliable_queue import ReliableQueueService  # noqa: E402
+from piqnyx_reliable_queue import (  # noqa: E402
+    DEFAULT_RETRY_MAX_SECONDS,
+    ReliableQueueService,
+)
 
 
 async def _wait_until(predicate, timeout: float = 1.0) -> None:
@@ -230,6 +233,21 @@ def test_retry_policy_distinguishes_expensive_and_transient_failures():
     assert service._retry_delay(5, RuntimeError('boom')) == ('unexpected', 32.0)
 
 
+def test_retry_delay_saturates_without_overflow_after_extreme_outage():
+    service = ReliableQueueService(retry_base_seconds=2, retry_max_seconds=900)
+
+    assert service._retry_delay(1_000_000, RuntimeError('still unavailable')) == (
+        'unexpected',
+        900.0,
+    )
+
+
+def test_default_retry_ceiling_is_fifteen_minutes():
+    assert DEFAULT_RETRY_MAX_SECONDS == 900.0
+    service = ReliableQueueService()
+    assert service._retry_max_seconds == 900.0
+
+
 def test_retry_configuration_validation_and_legacy_attempt_limit_is_ignored():
     # Old deployments may still carry EPISODE_PROCESS_MAX_ATTEMPTS. It no longer
     # controls correctness and even zero is harmless because the parameter is ignored.
@@ -240,3 +258,9 @@ def test_retry_configuration_validation_and_legacy_attempt_limit_is_ignored():
 
     with pytest.raises(ValueError, match='EPISODE_PROCESS_RETRY_MAX_SECONDS'):
         ReliableQueueService(retry_base_seconds=2, retry_max_seconds=1)
+
+    with pytest.raises(ValueError, match='EPISODE_PROCESS_RETRY_BASE_SECONDS'):
+        ReliableQueueService(retry_base_seconds=float('inf'))
+
+    with pytest.raises(ValueError, match='EPISODE_PROCESS_RETRY_MAX_SECONDS'):
+        ReliableQueueService(retry_max_seconds=float('nan'))
