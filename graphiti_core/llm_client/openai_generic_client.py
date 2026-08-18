@@ -16,6 +16,7 @@ limitations under the License.
 
 import json
 import logging
+import os
 import re
 import typing
 from typing import Any, Literal
@@ -31,6 +32,26 @@ from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
 from .errors import EmptyResponseError, RateLimitError
 
 logger = logging.getLogger(__name__)
+
+
+def _reasoning_kwargs() -> dict[str, Any]:
+    """Reasoning effort for this request, if the deployment asked for one.
+
+    Observed against deepseek-v4-flash through opencode.ai: a 4,000-token
+    extraction request returned exactly 65,536 output tokens, repeatedly and
+    stably — the whole budget spent before any JSON was emitted, so nothing ever
+    parsed and no episode was ever stored. Reasoning tokens count towards that
+    budget, which makes turning them down the one lever that addresses the cause
+    rather than the symptom.
+
+    Read from the environment rather than the config schema so it can be changed
+    or removed by editing one line of the env file and restarting, with no
+    rebuild — this is a setting that has to be tried against a live backend, and
+    measurements so far say the safe value is not obvious. Unset sends nothing at
+    all, which is exactly the behaviour before this existed.
+    """
+    effort = os.environ.get('GRAPHITI_REASONING_EFFORT', '').strip()
+    return {'reasoning_effort': effort} if effort else {}
 
 DEFAULT_MODEL = 'gpt-4.1-mini'
 
@@ -158,6 +179,7 @@ class OpenAIGenericClient(LLMClient):
                 temperature=self.temperature,
                 max_tokens=max_tokens,
                 response_format=self._build_response_format(response_model),  # type: ignore[arg-type]
+                **_reasoning_kwargs(),
             )
             result = response.choices[0].message.content or ''
             # An empty body (refusal, length finish_reason, or a flaky endpoint) would make
