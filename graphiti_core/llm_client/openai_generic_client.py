@@ -119,7 +119,7 @@ class OpenAIGenericClient(LLMClient):
         client (AsyncOpenAI): The OpenAI client used to interact with the API.
         model (str): The model name to use for generating responses.
         temperature (float): The temperature to use for generating responses.
-        max_tokens (int): The maximum number of tokens to generate in a response.
+        max_tokens (int): Deployment-wide maximum output budget.
         structured_output_mode (StructuredOutputMode): How structured output is requested.
     """
 
@@ -138,7 +138,8 @@ class OpenAIGenericClient(LLMClient):
             config (LLMConfig | None): The configuration for the LLM client, including API key, model, base URL, temperature, and max tokens.
             cache (bool): Whether to use caching for responses. Defaults to False.
             client (Any | None): An optional async client instance to use. If not provided, a new AsyncOpenAI client is created.
-            max_tokens (int): The maximum number of tokens to generate. Defaults to 16384 (16K) for better compatibility with local models.
+            max_tokens (int): Deployment-wide maximum output budget. Per-prompt requests may
+                ask for less but cannot silently raise this ceiling.
             structured_output_mode (StructuredOutputMode): Whether to request structured
                 output via native ``json_schema`` (the default, uses constrained decoding)
                 or to fall back to ``json_object``. Set to ``'json_object'`` for providers
@@ -156,7 +157,8 @@ class OpenAIGenericClient(LLMClient):
 
         super().__init__(config, cache)
 
-        # Override max_tokens to support higher limits for local models
+        # The factory passes deployment config here. Treat it as an upper bound so
+        # one extraction helper cannot accidentally turn a 4K deployment into 128K.
         self.max_tokens = max_tokens
         self.structured_output_mode: StructuredOutputMode = structured_output_mode
 
@@ -314,8 +316,10 @@ class OpenAIGenericClient(LLMClient):
         attribute_extraction: bool = False,
     ) -> dict[str, typing.Any]:
         self._apply_attribute_extraction_preamble(messages, attribute_extraction)
-        if max_tokens is None:
-            max_tokens = self.max_tokens
+        requested_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+        # The deployment config is a hard ceiling. This makes the central
+        # llm.max_tokens setting authoritative even if a helper passes 131072.
+        max_tokens = min(requested_max_tokens, self.max_tokens)
 
         # In json_object fallback mode the API does not enforce the schema, so embed it in
         # the prompt to guide the model. In json_schema mode the schema is enforced via
@@ -345,6 +349,8 @@ class OpenAIGenericClient(LLMClient):
                     'prompt_name': prompt_name,
                     'group_id': group_id,
                     'model_size': model_size.value,
+                    'requested_max_tokens': requested_max_tokens,
+                    'effective_max_tokens': max_tokens,
                 }
             )
             try:
