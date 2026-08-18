@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from ..prompts.models import Message
 from .client import LLMClient, get_extraction_language_instruction
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
-from .errors import EmptyResponseError, RateLimitError
+from .errors import EmptyResponseError, OutputLimitError, RateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -246,12 +246,13 @@ class OpenAIGenericClient(LLMClient):
             response = await self.client.chat.completions.create(**request_kwargs)
             choice = response.choices[0]
             result = choice.message.content or ''
+            finish_reason = getattr(choice, 'finish_reason', None)
             _trace_llm_event(
                 {
                     'event': 'response',
                     'request_id': request_id,
                     **trace_context,
-                    'finish_reason': getattr(choice, 'finish_reason', None),
+                    'finish_reason': finish_reason,
                     'usage': _trace_value(getattr(response, 'usage', None)),
                     'content_chars': len(result),
                     # Preserve the exact body before fences are stripped or JSON is parsed.
@@ -259,8 +260,16 @@ class OpenAIGenericClient(LLMClient):
                 }
             )
 
-            # An empty body (refusal, length finish_reason, or a flaky endpoint) would make
-            # json.loads raise a cryptic JSONDecodeError; surface a clear error instead.
+            # An explicit length stop is deterministic for an unchanged request and
+            # budget. Do not let the generic JSON retry wrapper spend that budget four
+            # more times before the durable outer episode queue backs off.
+            if finish_reason == 'length':
+                raise OutputLimitError(
+                    f'LLM output limit reached (max_tokens={max_tokens}, content_chars={len(result)})'
+                )
+
+            # An empty body (refusal or a flaky endpoint) would make json.loads raise a
+            # cryptic JSONDecodeError; surface a clear error instead.
             if not result:
                 raise EmptyResponseError('LLM returned an empty response')
             # Many OpenAI-compatible/local models wrap JSON in a ```json fence even under a
@@ -339,10 +348,9 @@ class OpenAIGenericClient(LLMClient):
                 }
             )
             try:
-                # Delegate to the base tenacity wrapper so transient JSONDecodeError /
-                # RateLimitError get backoff-retried (4 attempts). Every attempt receives
-                # its own request_id in the exact trace, so retries are visible instead of
-                # looking like one mysterious oversized provider call.
+                # Delegate to the base tenacity wrapper so genuinely transient JSON /
+                # rate-limit failures get bounded backoff retries. OutputLimitError is
+                # intentionally not retryable here: the outer durable queue owns that wait.
                 return await self._generate_response_with_retry(
                     messages, response_model, max_tokens=max_tokens, model_size=model_size
                 )
