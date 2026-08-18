@@ -107,7 +107,6 @@ async def test_json_object_mode_uses_json_object_and_injects_schema():
 
     call = completions.create_calls[0]
     assert call['response_format'] == {'type': 'json_object'}
-    # The schema must be injected into the prompt since the API will not enforce it.
     sent_user_content = call['messages'][-1]['content']
     assert 'Respond with a JSON object in the following format' in sent_user_content
     assert json.dumps(ResponseModel.model_json_schema()) in sent_user_content
@@ -181,11 +180,55 @@ async def test_output_limit_is_not_immediately_retried():
 
 
 @pytest.mark.asyncio
+async def test_hidden_reasoning_that_spends_the_whole_budget_before_content_is_output_limit():
+    # Some compatible gateways do not report finish_reason=length when hidden
+    # reasoning consumes the entire completion budget. The provider usage is the
+    # second signal and prevents four identical full-budget retries.
+    usage = SimpleNamespace(prompt_tokens=3581, completion_tokens=4096, total_tokens=7677)
+    client, completions = _make_client(content='', finish_reason='stop', usage=usage)
+
+    with pytest.raises(OutputLimitError, match='budget exhausted before content'):
+        await client.generate_response(
+            _messages(),
+            response_model=ResponseModel,
+            max_tokens=4096,
+            group_id='main',
+            prompt_name='extract_edges.edge',
+        )
+
+    assert len(completions.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_full_budget_malformed_json_is_output_limit_not_json_retry():
+    usage = SimpleNamespace(prompt_tokens=3581, completion_tokens=4096, total_tokens=7677)
+    client, completions = _make_client(
+        content='{"foo":"never closed',
+        finish_reason='stop',
+        usage=usage,
+    )
+
+    with pytest.raises(OutputLimitError, match='malformed JSON'):
+        await client.generate_response(
+            _messages(),
+            response_model=ResponseModel,
+            max_tokens=4096,
+            group_id='main',
+            prompt_name='extract_edges.edge',
+        )
+
+    assert len(completions.create_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_exact_jsonl_trace_records_real_request_and_raw_response(tmp_path, monkeypatch):
     trace_path = tmp_path / 'llm-trace.jsonl'
     monkeypatch.setenv('GRAPHITI_LLM_TRACE_FILE', str(trace_path))
     monkeypatch.setenv('GRAPHITI_REASONING_EFFORT', 'none')
 
+    # Deliberately odd usage data proves the trace records what the gateway says,
+    # rather than reconstructing token counts locally. A valid structured body is
+    # still accepted even if a compatible proxy reports surprising usage metadata.
     usage = SimpleNamespace(prompt_tokens=3581, completion_tokens=65536, total_tokens=69117)
     client, completions = _make_client(usage=usage)
 
@@ -208,7 +251,7 @@ async def test_exact_jsonl_trace_records_real_request_and_raw_response(tmp_path,
     assert request['request'] == sent
     assert request['request']['model'] == 'test-model'
     assert request['request']['max_tokens'] == 4096
-    assert request['request']['temperature'] == 0
+    assert request['request']['temperature'] == client.temperature
     assert request['request']['reasoning_effort'] == 'none'
     assert request['request']['response_format']['type'] == 'json_schema'
     assert request['request']['messages'][-1] == {'role': 'user', 'content': 'user message'}
@@ -228,8 +271,6 @@ async def test_exact_jsonl_trace_records_real_request_and_raw_response(tmp_path,
 
 @pytest.mark.asyncio
 async def test_strips_markdown_code_fence_before_parsing():
-    # Local/compatible models (e.g. Ollama/gemma) often wrap JSON in a ```json fence even
-    # under a structured response_format; the client must strip it before json.loads.
     fenced = '```json\n{"foo": "bar"}\n```'
     client, _ = _make_client(content=fenced)
 
@@ -240,8 +281,6 @@ async def test_strips_markdown_code_fence_before_parsing():
 
 @pytest.mark.asyncio
 async def test_non_retryable_error_is_not_retried():
-    # The old hand-rolled re-prompt loop is gone. Retry is delegated to the base
-    # tenacity wrapper, which only retries classified transient errors.
     client, completions = _make_client(error=ValueError('bad response'))
 
     with pytest.raises(ValueError):
