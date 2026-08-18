@@ -37,6 +37,8 @@ jobs:
         run: |
           uv run pytest -q \
             tests/llm_client/test_openai_generic_client.py \
+            tests/llm_client/test_openai_generic_limits.py \
+            tests/test_request_scope_isolation.py \
             -p no:cacheprovider
       - name: Install MCP server and local core
         working-directory: mcp_server
@@ -50,6 +52,8 @@ jobs:
         run: |
           uv run pytest -q \
             tests/test_piqnyx_atomic_ingestion.py \
+            tests/test_piqnyx_reliable_queue.py \
             tests/test_piqnyx_uuid_ingestion.py \
             tests/test_piqnyx_saga_state.py \
+            tests/test_piqnyx_saga_integrity.py \
             -p no:cacheprovider
