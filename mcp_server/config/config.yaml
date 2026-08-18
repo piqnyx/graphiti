@@ -13,7 +13,11 @@ server:
 llm:
   provider: "openai"  # Options: openai, azure_openai, anthropic, gemini, groq
   model: ${MODEL_NAME:gpt-5.5}
-  max_tokens: 4096
+  # Hard deployment-wide completion ceiling. Individual Graphiti prompts may ask
+  # for less but cannot raise this value. Keep Graphiti's established 16K baseline
+  # by default; live deployments can raise/lower it explicitly while the exact
+  # request trace shows whether a provider is actually honoring the budget.
+  max_tokens: ${LLM_MAX_TOKENS:16384}
   # Use json_object for OpenAI-compatible providers that accept json_schema
   # but do not reliably enforce the requested Pydantic schema.
   structured_output_mode: ${LLM_STRUCTURED_OUTPUT_MODE:json_schema}
@@ -38,7 +42,7 @@ llm:
       
     gemini:
       api_key: ${GOOGLE_API_KEY}
-      project_id: ${GOOGLE_PROJECT_ID:}
+      project_id: ${GOOGLE_PROJECT_ID}
       location: ${GOOGLE_LOCATION:us-central1}
       
     groq:
@@ -65,7 +69,7 @@ embedder:
       
     gemini:
       api_key: ${GOOGLE_API_KEY}
-      project_id: ${GOOGLE_PROJECT_ID:}
+      project_id: ${GOOGLE_PROJECT_ID}
       location: ${GOOGLE_LOCATION:us-central1}
       
     voyage:

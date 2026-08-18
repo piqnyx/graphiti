@@ -18,8 +18,12 @@ import json
 import logging
 import os
 import re
+import threading
 import typing
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import Any, Literal
+from uuid import uuid4
 
 import openai
 from openai import AsyncOpenAI
@@ -29,29 +33,85 @@ from pydantic import BaseModel
 from ..prompts.models import Message
 from .client import LLMClient, get_extraction_language_instruction
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
-from .errors import EmptyResponseError, RateLimitError
+from .errors import EmptyResponseError, OutputLimitError, RateLimitError
 
 logger = logging.getLogger(__name__)
+
+_TRACE_LOCK = threading.Lock()
+_TRACE_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    'graphiti_openai_generic_trace_context', default=None
+)
 
 
 def _reasoning_kwargs() -> dict[str, Any]:
     """Reasoning effort for this request, if the deployment asked for one.
 
-    Observed against deepseek-v4-flash through opencode.ai: a 4,000-token
-    extraction request returned exactly 65,536 output tokens, repeatedly and
-    stably — the whole budget spent before any JSON was emitted, so nothing ever
-    parsed and no episode was ever stored. Reasoning tokens count towards that
-    budget, which makes turning them down the one lever that addresses the cause
-    rather than the symptom.
-
-    Read from the environment rather than the config schema so it can be changed
-    or removed by editing one line of the env file and restarting, with no
-    rebuild — this is a setting that has to be tried against a live backend, and
-    measurements so far say the safe value is not obvious. Unset sends nothing at
-    all, which is exactly the behaviour before this existed.
+    This is intentionally an environment switch because OpenAI-compatible gateways
+    differ in which reasoning values they accept. The exact request/response trace
+    can be enabled separately to verify what was actually sent and what the gateway
+    returned instead of inferring provider behaviour from token totals.
     """
     effort = os.environ.get('GRAPHITI_REASONING_EFFORT', '').strip()
     return {'reasoning_effort': effort} if effort else {}
+
+
+def _trace_value(value: Any) -> Any:
+    """Convert SDK response objects to JSON-compatible diagnostic values."""
+    if value is None or isinstance(value, (str, int, float, bool, list, dict)):
+        return value
+    model_dump = getattr(value, 'model_dump', None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode='json')
+        except TypeError:
+            return model_dump()
+    try:
+        return vars(value)
+    except TypeError:
+        return str(value)
+
+
+def _completion_tokens(usage: Any) -> int | None:
+    """Return provider-reported completion tokens without assuming an SDK shape."""
+    if usage is None:
+        return None
+    value = usage.get('completion_tokens') if isinstance(usage, dict) else getattr(
+        usage, 'completion_tokens', None
+    )
+    return value if isinstance(value, int) and value >= 0 else None
+
+
+def _trace_llm_event(event: dict[str, Any]) -> None:
+    """Append an opt-in JSONL event containing the real LLM request or response.
+
+    Set GRAPHITI_LLM_TRACE_FILE to a writable path to enable it. Conversation text
+    and raw model output are intentionally included because this trace exists to
+    reproduce malformed extraction calls. API credentials are never included.
+    Trace I/O is best-effort and must never break ingestion.
+    """
+    path = os.environ.get('GRAPHITI_LLM_TRACE_FILE', '').strip()
+    if not path:
+        return
+
+    record = {'timestamp': datetime.now(timezone.utc).isoformat(), **event}
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, default=str, separators=(',', ':'))
+        with _TRACE_LOCK:
+            with open(path, 'a', encoding='utf-8') as trace_file:
+                trace_file.write(line)
+                trace_file.write('\n')
+                trace_file.flush()
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                # Permissions are best-effort diagnostics, never ingestion state.
+                pass
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never break ingestion
+        logger.warning('Failed to write GRAPHITI_LLM_TRACE_FILE: %s', exc)
+
 
 DEFAULT_MODEL = 'gpt-4.1-mini'
 
@@ -74,7 +134,7 @@ class OpenAIGenericClient(LLMClient):
         client (AsyncOpenAI): The OpenAI client used to interact with the API.
         model (str): The model name to use for generating responses.
         temperature (float): The temperature to use for generating responses.
-        max_tokens (int): The maximum number of tokens to generate in a response.
+        max_tokens (int): Deployment-wide maximum output budget.
         structured_output_mode (StructuredOutputMode): How structured output is requested.
     """
 
@@ -93,7 +153,8 @@ class OpenAIGenericClient(LLMClient):
             config (LLMConfig | None): The configuration for the LLM client, including API key, model, base URL, temperature, and max tokens.
             cache (bool): Whether to use caching for responses. Defaults to False.
             client (Any | None): An optional async client instance to use. If not provided, a new AsyncOpenAI client is created.
-            max_tokens (int): The maximum number of tokens to generate. Defaults to 16384 (16K) for better compatibility with local models.
+            max_tokens (int): Deployment-wide maximum output budget. Per-prompt requests may
+                ask for less but cannot silently raise this ceiling.
             structured_output_mode (StructuredOutputMode): Whether to request structured
                 output via native ``json_schema`` (the default, uses constrained decoding)
                 or to fall back to ``json_object``. Set to ``'json_object'`` for providers
@@ -111,7 +172,8 @@ class OpenAIGenericClient(LLMClient):
 
         super().__init__(config, cache)
 
-        # Override max_tokens to support higher limits for local models
+        # The factory passes deployment config here. Treat it as an upper bound so
+        # one extraction helper cannot accidentally turn a 4K deployment into 128K.
         self.max_tokens = max_tokens
         self.structured_output_mode: StructuredOutputMode = structured_output_mode
 
@@ -148,9 +210,9 @@ class OpenAIGenericClient(LLMClient):
     def _strip_code_fences(text: str) -> str:
         """Strip a wrapping markdown code fence from a JSON payload.
 
-        OpenAI-compatible models served via Ollama/llama.cpp etc. frequently wrap their
-        output in a ```json … ``` fence even when a json_schema/json_object response_format
-        is requested, which breaks a bare ``json.loads``. No-op when there is no fence.
+        OpenAI-compatible models served via Ollama/llama.cpp etc. frequently wrap JSON in a
+        ```json … ``` fence even when a json_schema/json_object response_format is requested,
+        which breaks a bare ``json.loads``. No-op when there is no fence.
         """
         stripped = text.strip()
         if stripped.startswith('```'):
@@ -172,29 +234,108 @@ class OpenAIGenericClient(LLMClient):
                 openai_messages.append({'role': 'user', 'content': m.content})
             elif m.role == 'system':
                 openai_messages.append({'role': 'system', 'content': m.content})
+
+        request_id = uuid4().hex
+        request_kwargs: dict[str, Any] = {
+            'model': self.model or DEFAULT_MODEL,
+            'messages': openai_messages,
+            'temperature': self.temperature,
+            'max_tokens': max_tokens,
+            'response_format': self._build_response_format(response_model),
+            **_reasoning_kwargs(),
+        }
+        trace_context = _TRACE_CONTEXT.get() or {}
+        _trace_llm_event(
+            {
+                'event': 'request',
+                'request_id': request_id,
+                'base_url': str(getattr(self.client, 'base_url', '')),
+                'structured_output_mode': self.structured_output_mode,
+                'response_model': getattr(response_model, '__name__', None),
+                **trace_context,
+                # This exact dict is expanded into create() below. The trace is
+                # therefore the request, not a separately reconstructed approximation.
+                'request': request_kwargs,
+            }
+        )
+
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model or DEFAULT_MODEL,
-                messages=openai_messages,
-                temperature=self.temperature,
-                max_tokens=max_tokens,
-                response_format=self._build_response_format(response_model),  # type: ignore[arg-type]
-                **_reasoning_kwargs(),
+            response = await self.client.chat.completions.create(**request_kwargs)
+            choice = response.choices[0]
+            result = choice.message.content or ''
+            finish_reason = getattr(choice, 'finish_reason', None)
+            usage = getattr(response, 'usage', None)
+            completion_tokens = _completion_tokens(usage)
+            _trace_llm_event(
+                {
+                    'event': 'response',
+                    'request_id': request_id,
+                    **trace_context,
+                    'finish_reason': finish_reason,
+                    'usage': _trace_value(usage),
+                    'content_chars': len(result),
+                    # Preserve the exact body before fences are stripped or JSON is parsed.
+                    'content': result,
+                }
             )
-            result = response.choices[0].message.content or ''
-            # An empty body (refusal, length finish_reason, or a flaky endpoint) would make
-            # json.loads raise a cryptic JSONDecodeError; surface a clear error instead.
+
+            # Explicit length is definitive. Some OpenAI-compatible gateways have also
+            # been observed to report stop/empty content while billing exactly the entire
+            # completion budget to hidden reasoning. Treat that as the same failure when
+            # the body is absent or cannot be parsed below.
+            budget_exhausted = completion_tokens is not None and completion_tokens >= max_tokens
+            if finish_reason == 'length':
+                raise OutputLimitError(
+                    f'LLM output limit reached (max_tokens={max_tokens}, completion_tokens={completion_tokens}, content_chars={len(result)})'
+                )
+
             if not result:
+                if budget_exhausted:
+                    raise OutputLimitError(
+                        f'LLM completion budget exhausted before content (max_tokens={max_tokens}, completion_tokens={completion_tokens})'
+                    )
                 raise EmptyResponseError('LLM returned an empty response')
-            # Many OpenAI-compatible/local models wrap JSON in a ```json fence even under a
-            # structured response_format; strip it before parsing.
-            parsed = json.loads(self._strip_code_fences(result))
+
+            try:
+                parsed = json.loads(self._strip_code_fences(result))
+            except json.JSONDecodeError as exc:
+                if budget_exhausted:
+                    raise OutputLimitError(
+                        f'LLM completion budget exhausted with malformed JSON (max_tokens={max_tokens}, completion_tokens={completion_tokens}, content_chars={len(result)})'
+                    ) from exc
+                raise
+
             if response_model is not None:
-                return response_model.model_validate(parsed).model_dump()
+                try:
+                    return response_model.model_validate(parsed).model_dump()
+                except Exception as exc:
+                    if budget_exhausted:
+                        raise OutputLimitError(
+                            f'LLM completion budget exhausted with incomplete structured output (max_tokens={max_tokens}, completion_tokens={completion_tokens}, content_chars={len(result)})'
+                        ) from exc
+                    raise
             return parsed
         except openai.RateLimitError as e:
+            _trace_llm_event(
+                {
+                    'event': 'error',
+                    'request_id': request_id,
+                    **trace_context,
+                    'error_type': type(e).__name__,
+                    'error': str(e),
+                }
+            )
             raise RateLimitError from e
         except Exception as e:
+            _trace_llm_event(
+                {
+                    'event': 'error',
+                    'request_id': request_id,
+                    **trace_context,
+                    'error_type': type(e).__name__,
+                    'error': str(e),
+                }
+            )
             logger.error(f'Error in generating LLM response: {e}')
             raise
 
@@ -210,17 +351,17 @@ class OpenAIGenericClient(LLMClient):
         attribute_extraction: bool = False,
     ) -> dict[str, typing.Any]:
         self._apply_attribute_extraction_preamble(messages, attribute_extraction)
-        if max_tokens is None:
-            max_tokens = self.max_tokens
+        requested_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+        # The deployment config is a hard ceiling. This makes the central
+        # llm.max_tokens setting authoritative even if a helper passes 131072.
+        max_tokens = min(requested_max_tokens, self.max_tokens)
 
         # In json_object fallback mode the API does not enforce the schema, so embed it in
         # the prompt to guide the model. In json_schema mode the schema is enforced via
         # response_format, so no prompt injection is needed.
         if response_model is not None and self.structured_output_mode == 'json_object':
             serialized_model = json.dumps(response_model.model_json_schema())
-            messages[
-                -1
-            ].content += (
+            messages[-1].content += (
                 f'\n\nRespond with a JSON object in the following format:\n\n{serialized_model}'
             )
 
@@ -238,12 +379,19 @@ class OpenAIGenericClient(LLMClient):
                 attributes['prompt.name'] = prompt_name
             span.add_attributes(attributes)
 
+            token = _TRACE_CONTEXT.set(
+                {
+                    'prompt_name': prompt_name,
+                    'group_id': group_id,
+                    'model_size': model_size.value,
+                    'requested_max_tokens': requested_max_tokens,
+                    'effective_max_tokens': max_tokens,
+                }
+            )
             try:
-                # Delegate to the base tenacity wrapper so transient JSONDecodeError /
-                # RateLimitError get backoff-retried (4 attempts) — most relevant in the
-                # json_object fallback path for less-reliable providers. This is the clean
-                # retry mechanism (same pattern as Gliner2Client); the old hand-rolled
-                # re-prompt loop is intentionally not reinstated.
+                # Delegate to the base tenacity wrapper so genuinely transient JSON /
+                # rate-limit failures get bounded backoff retries. OutputLimitError is
+                # intentionally not retryable here: the outer durable queue owns that wait.
                 return await self._generate_response_with_retry(
                     messages, response_model, max_tokens=max_tokens, model_size=model_size
                 )
@@ -251,3 +399,5 @@ class OpenAIGenericClient(LLMClient):
                 span.set_status('error', str(e))
                 span.record_exception(e)
                 raise
+            finally:
+                _TRACE_CONTEXT.reset(token)
