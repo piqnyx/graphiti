@@ -37,3 +37,16 @@ class EmptyResponseError(Exception):
     def __init__(self, message: str):
         self.message = message
         super().__init__(self.message)
+
+
+class OutputLimitError(Exception):
+    """The provider explicitly stopped because the configured output budget was exhausted.
+
+    Retrying the identical request immediately is not a transient recovery strategy: it
+    spends the same budget again. The caller may retry later after configuration/model
+    changes, while the outer durable episode queue preserves FIFO order.
+    """
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)
