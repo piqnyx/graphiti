@@ -6,24 +6,32 @@ import pytest
 from pydantic import BaseModel
 
 from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.llm_client.errors import EmptyResponseError, RateLimitError
+from graphiti_core.llm_client.errors import EmptyResponseError, OutputLimitError, RateLimitError
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.prompts.models import Message
 
 
 class DummyChatCompletions:
-    def __init__(self, content: str = '{}', error: Exception | None = None):
+    def __init__(
+        self,
+        content: str = '{}',
+        error: Exception | None = None,
+        finish_reason: str | None = 'stop',
+        usage=None,
+    ):
         self.create_calls: list[dict] = []
         self._content = content
         self._error = error
+        self._finish_reason = finish_reason
+        self._usage = usage
 
     async def create(self, **kwargs):
         self.create_calls.append(kwargs)
         if self._error is not None:
             raise self._error
         message = SimpleNamespace(content=self._content)
-        choice = SimpleNamespace(message=message)
-        return SimpleNamespace(choices=[choice])
+        choice = SimpleNamespace(message=message, finish_reason=self._finish_reason)
+        return SimpleNamespace(choices=[choice], usage=self._usage)
 
 
 class DummyChat:
@@ -47,8 +55,19 @@ def _messages() -> list[Message]:
     ]
 
 
-def _make_client(content: str = '{"foo": "bar"}', error: Exception | None = None, **kwargs):
-    completions = DummyChatCompletions(content=content, error=error)
+def _make_client(
+    content: str = '{"foo": "bar"}',
+    error: Exception | None = None,
+    finish_reason: str | None = 'stop',
+    usage=None,
+    **kwargs,
+):
+    completions = DummyChatCompletions(
+        content=content,
+        error=error,
+        finish_reason=finish_reason,
+        usage=usage,
+    )
     client = OpenAIGenericClient(
         config=LLMConfig(api_key='test', model='test-model'),
         client=DummyClient(completions),
@@ -126,10 +145,8 @@ async def test_rate_limit_error_is_translated():
 
 @pytest.mark.asyncio
 async def test_empty_content_raises_empty_response_error():
-    # Empty body (flaky endpoint / refusal / length cutoff) must raise a clear error,
-    # not a cryptic JSONDecodeError from json.loads(''). Asserted at _generate_response
-    # level: EmptyResponseError is retryable, so generate_response would invoke the real
-    # backoff retry and slow this unit test.
+    # Empty body from a flaky/refusing endpoint is a transient class. A provider that
+    # explicitly says finish_reason=length is handled separately as OutputLimitError.
     client, _ = _make_client(content='')
 
     with pytest.raises(EmptyResponseError):
@@ -137,11 +154,76 @@ async def test_empty_content_raises_empty_response_error():
 
 
 def test_empty_response_error_is_retryable():
-    # An empty body is treated as a transient provider hiccup (common on local/compatible
-    # endpoints), so the base retry wrapper retries it rather than failing on first try.
     from graphiti_core.llm_client.client import is_server_or_retry_error
 
     assert is_server_or_retry_error(EmptyResponseError('empty')) is True
+
+
+@pytest.mark.asyncio
+async def test_output_limit_is_not_immediately_retried():
+    client, completions = _make_client(
+        content='{"foo":"truncated',
+        finish_reason='length',
+    )
+
+    with pytest.raises(OutputLimitError, match='max_tokens=4096'):
+        await client.generate_response(
+            _messages(),
+            response_model=ResponseModel,
+            max_tokens=4096,
+            group_id='main',
+            prompt_name='extract_edges.edge',
+        )
+
+    # An unchanged length-limited request will deterministically burn the same budget.
+    # The durable episode queue owns the later retry, after backoff/config changes.
+    assert len(completions.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_exact_jsonl_trace_records_real_request_and_raw_response(tmp_path, monkeypatch):
+    trace_path = tmp_path / 'llm-trace.jsonl'
+    monkeypatch.setenv('GRAPHITI_LLM_TRACE_FILE', str(trace_path))
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT', 'none')
+
+    usage = SimpleNamespace(prompt_tokens=3581, completion_tokens=65536, total_tokens=69117)
+    client, completions = _make_client(usage=usage)
+
+    result = await client.generate_response(
+        _messages(),
+        response_model=ResponseModel,
+        max_tokens=4096,
+        group_id='main',
+        prompt_name='extract_edges.edge',
+    )
+    assert result == {'foo': 'bar'}
+
+    records = [json.loads(line) for line in trace_path.read_text(encoding='utf-8').splitlines()]
+    assert [record['event'] for record in records] == ['request', 'response']
+
+    request = records[0]
+    sent = completions.create_calls[0]
+    assert request['prompt_name'] == 'extract_edges.edge'
+    assert request['group_id'] == 'main'
+    assert request['request'] == sent
+    assert request['request']['model'] == 'test-model'
+    assert request['request']['max_tokens'] == 4096
+    assert request['request']['temperature'] == 0
+    assert request['request']['reasoning_effort'] == 'none'
+    assert request['request']['response_format']['type'] == 'json_schema'
+    assert request['request']['messages'][-1] == {'role': 'user', 'content': 'user message'}
+
+    response = records[1]
+    assert response['request_id'] == request['request_id']
+    assert response['prompt_name'] == 'extract_edges.edge'
+    assert response['finish_reason'] == 'stop'
+    assert response['usage'] == {
+        'prompt_tokens': 3581,
+        'completion_tokens': 65536,
+        'total_tokens': 69117,
+    }
+    assert response['content'] == '{"foo": "bar"}'
+    assert response['content_chars'] == len('{"foo": "bar"}')
 
 
 @pytest.mark.asyncio
@@ -158,10 +240,8 @@ async def test_strips_markdown_code_fence_before_parsing():
 
 @pytest.mark.asyncio
 async def test_non_retryable_error_is_not_retried():
-    # The old hand-rolled re-prompt loop is gone. Retry is now delegated to the base
-    # tenacity wrapper, which only retries transient errors (RateLimitError /
-    # JSONDecodeError). A non-retryable error (e.g. ValueError) propagates after a
-    # single create call.
+    # The old hand-rolled re-prompt loop is gone. Retry is delegated to the base
+    # tenacity wrapper, which only retries classified transient errors.
     client, completions = _make_client(error=ValueError('bad response'))
 
     with pytest.raises(ValueError):
