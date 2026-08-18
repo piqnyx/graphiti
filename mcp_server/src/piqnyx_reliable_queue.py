@@ -12,6 +12,7 @@ is already active or queued are acknowledged without enqueuing a second executio
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -27,7 +28,7 @@ _BaseQueueService = queue_module.QueueService
 _installed = False
 
 DEFAULT_RETRY_BASE_SECONDS = 2.0
-DEFAULT_RETRY_MAX_SECONDS = 3600.0
+DEFAULT_RETRY_MAX_SECONDS = 900.0
 
 
 class EpisodeQueueBlockedError(RuntimeError):
@@ -79,9 +80,9 @@ class ReliableQueueService(_BaseQueueService):
         try:
             parsed = float(raw)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f'{env_name} must be a non-negative number') from exc
-        if parsed < 0:
-            raise ValueError(f'{env_name} must be a non-negative number')
+            raise ValueError(f'{env_name} must be a finite non-negative number') from exc
+        if not math.isfinite(parsed) or parsed < 0:
+            raise ValueError(f'{env_name} must be a finite non-negative number')
         return parsed
 
     def _ensure_worker(self, group_id: str) -> None:
@@ -277,7 +278,23 @@ class ReliableQueueService(_BaseQueueService):
 
     def _retry_delay(self, failed_attempt_number: int, exc: Exception) -> tuple[str, float]:
         failure_kind, floor = self._failure_policy(exc)
-        exponential = self._retry_base_seconds * (2 ** max(failed_attempt_number - 1, 0))
+        if self._retry_base_seconds == 0 or self._retry_max_seconds == 0:
+            exponential = 0.0
+        else:
+            # Cap the exponent before evaluating it. Computing 2**attempt first can
+            # overflow after a long outage even though the final delay is capped.
+            max_exponent = max(
+                0,
+                math.ceil(
+                    math.log2(self._retry_max_seconds)
+                    - math.log2(self._retry_base_seconds)
+                ),
+            )
+            exponent = min(max(failed_attempt_number - 1, 0), max_exponent)
+            exponential = min(
+                math.ldexp(self._retry_base_seconds, exponent),
+                self._retry_max_seconds,
+            )
         delay = max(exponential, floor)
         return failure_kind, min(delay, self._retry_max_seconds)
 
