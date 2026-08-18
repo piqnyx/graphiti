@@ -81,6 +81,30 @@ class ReliableQueueService(_BaseQueueService):
             raise ValueError(f'{env_name} must be a non-negative number')
         return parsed
 
+    def _ensure_worker(self, group_id: str) -> None:
+        """Start a worker for queued work when bookkeeping says none is alive.
+
+        The base service stores only a boolean, not the worker Task. An unexpected
+        exception in the worker therefore used to strand queued UUIDs forever: the
+        caller saw its UUID in get_queue_status and correctly refused to submit a
+        duplicate, while no worker existed to consume it. Status/duplicate checks
+        now self-heal that state on the event-loop thread.
+        """
+        queue = self._episode_queues.get(group_id)
+        if queue is None or queue.empty() or self._queue_workers.get(group_id, False):
+            return
+        self._queue_workers[group_id] = True
+        try:
+            asyncio.get_running_loop().create_task(self._process_episode_queue(group_id))
+        except Exception:
+            self._queue_workers[group_id] = False
+            raise
+        logger.warning(
+            'Restarted missing reliable episode queue worker group_id=%s pending=%d',
+            group_id,
+            queue.qsize(),
+        )
+
     async def add_episode(
         self,
         group_id: str,
@@ -100,7 +124,6 @@ class ReliableQueueService(_BaseQueueService):
         saga: str | None = None,
         saga_previous_episode_uuid: str | None = None,
     ) -> int:
-        """Attach identity metadata while preserving the ordinary enqueue path."""
         token = self._enqueue_metadata.set(
             {
                 'episode_uuid': uuid,
@@ -138,9 +161,6 @@ class ReliableQueueService(_BaseQueueService):
         queue = self._episode_queues.get(group_id)
         if queue is None:
             return []
-        # asyncio.Queue intentionally exposes no iterator. Reading its deque here is
-        # safe because this method is synchronous on the same event-loop thread and
-        # is diagnostics only; it never mutates the queue.
         queued = getattr(queue, '_queue', ())
         result: list[str] = []
         for process_func in list(queued):
@@ -156,8 +176,6 @@ class ReliableQueueService(_BaseQueueService):
         metadata = self._enqueue_metadata.get()
         episode_uuid = metadata.get('episode_uuid') if metadata is not None else None
 
-        # Caller retries are expected after lost HTTP/MCP responses and server
-        # reconnects. Never turn that into two expensive Graphiti executions.
         if isinstance(episode_uuid, str) and episode_uuid:
             if self._metadata_for_current(group_id).get('episode_uuid') == episode_uuid:
                 logger.info(
@@ -168,6 +186,7 @@ class ReliableQueueService(_BaseQueueService):
                 return 0
             queued_uuids = self._queued_episode_uuids(group_id)
             if episode_uuid in queued_uuids:
+                self._ensure_worker(group_id)
                 logger.info(
                     'Ignoring duplicate submission already queued group_id=%s episode_uuid=%s',
                     group_id,
@@ -184,10 +203,10 @@ class ReliableQueueService(_BaseQueueService):
             raise
 
     def is_group_blocked(self, group_id: str) -> bool:  # noqa: ARG002
-        """There is no terminal block state; a failing head remains the active head."""
         return False
 
     def get_failure_status(self, group_id: str) -> dict[str, Any]:
+        self._ensure_worker(group_id)
         metadata = self._metadata_for_current(group_id)
         return {
             'group_id': group_id,
@@ -258,7 +277,7 @@ class ReliableQueueService(_BaseQueueService):
         except asyncio.CancelledError:
             logger.info('Episode queue worker for group_id %s was cancelled', group_id)
         except Exception as exc:
-            logger.error(
+            logger.exception(
                 'Unexpected error in reliable queue worker for group_id %s: %s',
                 group_id,
                 str(exc),
@@ -268,11 +287,10 @@ class ReliableQueueService(_BaseQueueService):
             self._current_task.pop(group_id, None)
             self._current_attempts.pop(group_id, None)
             self._current_errors.pop(group_id, None)
-            logger.info('Stopped reliable episode queue worker for group_id: %s', group_id)
+            logger.info('Stopped episode queue worker for group_id: %s', group_id)
 
 
 def install_reliable_queue_patch() -> None:
-    """Expose ReliableQueueService before graphiti_mcp_server imports QueueService."""
     global _installed
     if _installed:
         return
