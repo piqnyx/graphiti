@@ -13,6 +13,7 @@ is already active or queued are acknowledged without enqueuing a second executio
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from datetime import datetime
@@ -69,6 +70,8 @@ class ReliableQueueService(_BaseQueueService):
         self._current_task: dict[str, Callable[[], Awaitable[None]]] = {}
         self._current_attempts: dict[str, int] = {}
         self._current_errors: dict[str, str] = {}
+        self._current_failure_kind: dict[str, str] = {}
+        self._current_retry_at: dict[str, float] = {}
 
     @staticmethod
     def _read_nonnegative_float(value: float | None, env_name: str, default: float) -> float:
@@ -208,11 +211,15 @@ class ReliableQueueService(_BaseQueueService):
     def get_failure_status(self, group_id: str) -> dict[str, Any]:
         self._ensure_worker(group_id)
         metadata = self._metadata_for_current(group_id)
+        retry_at = self._current_retry_at.get(group_id)
+        retry_in = None if retry_at is None else max(0.0, retry_at - time.monotonic())
         return {
             'group_id': group_id,
             'blocked': False,
             'attempts': self._current_attempts.get(group_id, 0),
             'last_error': self._current_errors.get(group_id),
+            'failure_kind': self._current_failure_kind.get(group_id),
+            'retry_in_seconds': round(retry_in, 3) if retry_in is not None else None,
             'pending': self.get_queue_size(group_id),
             'worker_running': self.is_worker_running(group_id),
             'episode_uuid': metadata.get('episode_uuid'),
@@ -221,9 +228,58 @@ class ReliableQueueService(_BaseQueueService):
             'queued_episode_uuids': self._queued_episode_uuids(group_id),
         }
 
-    def _retry_delay(self, failed_attempt_number: int) -> float:
-        delay = self._retry_base_seconds * (2 ** max(failed_attempt_number - 1, 0))
-        return min(delay, self._retry_max_seconds)
+    @staticmethod
+    def _failure_policy(exc: Exception) -> tuple[str, float]:
+        """Classify a failed processing attempt and choose a sensible retry floor.
+
+        The durable caller never drops the head, so even configuration/billing failures
+        remain retryable. The distinction only controls how aggressively we poke the
+        provider. Expensive deterministic failures deliberately cool down much longer
+        than a dropped TCP connection.
+        """
+        name = type(exc).__name__
+        message = str(exc).lower()
+        status_code = getattr(exc, 'status_code', None)
+
+        if name == 'OutputLimitError':
+            return 'output_limit', 300.0
+        if name == 'RateLimitError' or status_code == 429 or 'rate limit' in message:
+            return 'rate_limit', 30.0
+        if status_code in {401, 402, 403} or any(
+            marker in message
+            for marker in (
+                'insufficient balance',
+                'insufficient credit',
+                'payment required',
+                'quota exhausted',
+                'invalid api key',
+                'authentication',
+            )
+        ):
+            return 'credentials_or_balance', 300.0
+        if (
+            isinstance(status_code, int)
+            and status_code >= 500
+            or any(marker in name.lower() for marker in ('connection', 'timeout'))
+            or any(
+                marker in message
+                for marker in ('connection reset', 'connection refused', 'timed out', 'temporarily unavailable')
+            )
+        ):
+            return 'provider_unavailable', 10.0
+        if name in {'JSONDecodeError', 'ValidationError'}:
+            # These already went through the bounded per-call retry wrapper. Re-running
+            # the entire episode immediately would mostly repeat successful earlier calls.
+            return 'malformed_response', 60.0
+        if name == 'EmptyResponseError':
+            return 'empty_response', 10.0
+        return 'unexpected', 2.0
+
+    def _retry_delay(self, failed_attempt_number: int, exc: Exception) -> tuple[str, float]:
+        failure_kind, floor = self._failure_policy(exc)
+        exponential = self._retry_base_seconds * (2 ** max(failed_attempt_number - 1, 0))
+        delay = max(exponential, floor)
+        return failure_kind, min(delay, self._retry_max_seconds)
 
     async def _process_episode_queue(self, group_id: str) -> None:
         logger.info('Starting reliable episode queue worker for group_id: %s', group_id)
@@ -234,6 +290,8 @@ class ReliableQueueService(_BaseQueueService):
                 self._current_task[group_id] = process_func
                 self._current_attempts[group_id] = 0
                 self._current_errors.pop(group_id, None)
+                self._current_failure_kind.pop(group_id, None)
+                self._current_retry_at.pop(group_id, None)
                 metadata = self._task_metadata.get(id(process_func), {})
 
                 try:
@@ -256,23 +314,29 @@ class ReliableQueueService(_BaseQueueService):
                             failures = self._current_attempts.get(group_id, 0) + 1
                             self._current_attempts[group_id] = failures
                             self._current_errors[group_id] = str(exc)
-                            delay = self._retry_delay(failures)
+                            failure_kind, delay = self._retry_delay(failures, exc)
+                            self._current_failure_kind[group_id] = failure_kind
+                            self._current_retry_at[group_id] = time.monotonic() + delay
                             logger.warning(
                                 'Episode processing failed for group_id=%s episode_uuid=%s '
-                                'attempt=%d retry_in=%.3fs error=%s',
+                                'attempt=%d failure_kind=%s retry_in=%.3fs error=%s',
                                 group_id,
                                 metadata.get('episode_uuid'),
                                 failures,
+                                failure_kind,
                                 delay,
                                 str(exc),
                             )
                             if delay > 0:
                                 await asyncio.sleep(delay)
+                            self._current_retry_at.pop(group_id, None)
                 finally:
                     self._task_metadata.pop(id(process_func), None)
                     self._current_task.pop(group_id, None)
                     self._current_attempts.pop(group_id, None)
                     self._current_errors.pop(group_id, None)
+                    self._current_failure_kind.pop(group_id, None)
+                    self._current_retry_at.pop(group_id, None)
                     self._episode_queues[group_id].task_done()
         except asyncio.CancelledError:
             logger.info('Episode queue worker for group_id %s was cancelled', group_id)
@@ -287,6 +351,8 @@ class ReliableQueueService(_BaseQueueService):
             self._current_task.pop(group_id, None)
             self._current_attempts.pop(group_id, None)
             self._current_errors.pop(group_id, None)
+            self._current_failure_kind.pop(group_id, None)
+            self._current_retry_at.pop(group_id, None)
             logger.info('Stopped episode queue worker for group_id: %s', group_id)
 
 
