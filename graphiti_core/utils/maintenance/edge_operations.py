@@ -142,7 +142,13 @@ async def extract_edges(
     # using the configured one. A reasoning backend spends part of that budget on
     # reasoning tokens before emitting any JSON, so on larger episodes 16K can be
     # exhausted before the answer starts and the call returns an empty body.
-    extract_edges_max_tokens = 65536
+    #
+    # Raised to 128K after a live batch stopped at exactly 65536 output tokens:
+    # that is a truncated reply, not a long one — the JSON never closes, parsing
+    # fails, and the episode never appears while the caller sees only "queued".
+    # Note that the figure being pinned here at all is why raising llm.max_tokens
+    # in configuration had no effect on fact extraction.
+    extract_edges_max_tokens = 131072
     llm_client = clients.llm_client
 
     # Build mapping from edge type name to list of valid signatures
