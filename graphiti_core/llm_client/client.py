@@ -17,6 +17,7 @@ limitations under the License.
 import hashlib
 import json
 import logging
+import os
 import typing
 from abc import ABC, abstractmethod
 
@@ -49,6 +50,26 @@ def get_extraction_language_instruction(group_id: str | None = None) -> str:
     Returns:
         str: Language instruction to append to system messages
     """
+    configured = os.environ.get('GRAPHITI_OUTPUT_LANGUAGE', '').strip()
+    if configured:
+        # Naming the language outright, because inferring it does not survive a
+        # thinking model. Measured on one batch with mimo-v2.5: identical input and
+        # prompt, reasoning disabled produced ten Russian facts, reasoning enabled
+        # produced nine English ones ("Вит lives in the village of Григолети"). The
+        # default instruction below ends in "otherwise, output English", and that is
+        # the branch a reasoning model talks itself into.
+        #
+        # Only prose is pinned. Names stay as written -- a product is not translated
+        # -- and relation types stay the SCREAMING_SNAKE_CASE identifiers the prompts
+        # ask for, since search and every downstream consumer match on them.
+        return (
+            f'\n\nWrite every human-readable field -- facts, summaries, descriptions -- in {configured}, '
+            'whatever language the source used. '
+            'Keep proper nouns, product names, file names and identifiers exactly as they appear in the source; '
+            'do not translate or transliterate them. '
+            'Relationship type names remain English SCREAMING_SNAKE_CASE regardless of this setting.'
+        )
+
     return (
         '\n\nAny extracted information should be returned in the same language as it was written in. '
         'Only output non-English text when the user has written full sentences or phrases in that non-English language. '
