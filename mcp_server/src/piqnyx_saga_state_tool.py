@@ -133,22 +133,42 @@ def install_get_saga_tool(server: Any) -> None:
                 uuid=saga.uuid,
                 routing_='r',
             )
-            next_rows, _, _ = await scoped_driver.execute_query(
+            # Two plain queries rather than one aggregating pass. FalkorDB cannot carry
+            # an aggregated alias across a following MATCH: the combined form failed with
+            # "_AR_EXP_UpdateEntityIdx: Unable to locate a value with alias outgoing_rows
+            # within the record", which surfaced as every flush failing to commit. The
+            # union is trivially done here and the result is identical -- an OPTIONAL
+            # MATCH whose rows were then discarded for being NULL is just a MATCH.
+            outgoing_rows, _, _ = await scoped_driver.execute_query(
                 """
                 MATCH (s:Saga {uuid: $uuid})-[:HAS_EPISODE]->(member:Episodic)
-                OPTIONAL MATCH (member)-[:NEXT_EPISODE]->(outgoing:Episodic)
-                WITH s, collect(DISTINCT {source_uuid: member.uuid, target_uuid: outgoing.uuid}) AS outgoing_rows
-                MATCH (s)-[:HAS_EPISODE]->(member2:Episodic)
-                OPTIONAL MATCH (incoming:Episodic)-[:NEXT_EPISODE]->(member2)
-                WITH outgoing_rows + collect(DISTINCT {source_uuid: incoming.uuid, target_uuid: member2.uuid}) AS rows
-                UNWIND rows AS row
-                WITH row
-                WHERE row.source_uuid IS NOT NULL AND row.target_uuid IS NOT NULL
-                RETURN DISTINCT row.source_uuid AS source_uuid, row.target_uuid AS target_uuid
+                MATCH (member)-[:NEXT_EPISODE]->(outgoing:Episodic)
+                RETURN DISTINCT member.uuid AS source_uuid, outgoing.uuid AS target_uuid
                 """,
                 uuid=saga.uuid,
                 routing_='r',
             )
+            incoming_rows, _, _ = await scoped_driver.execute_query(
+                """
+                MATCH (s:Saga {uuid: $uuid})-[:HAS_EPISODE]->(member:Episodic)
+                MATCH (incoming:Episodic)-[:NEXT_EPISODE]->(member)
+                RETURN DISTINCT incoming.uuid AS source_uuid, member.uuid AS target_uuid
+                """,
+                uuid=saga.uuid,
+                routing_='r',
+            )
+            next_rows: list[dict[str, Any]] = []
+            seen_edges: set[tuple[str, str]] = set()
+            for row in (*outgoing_rows, *incoming_rows):
+                source = row.get('source_uuid')
+                target = row.get('target_uuid')
+                if not source or not target:
+                    continue
+                edge = (str(source), str(target))
+                if edge in seen_edges:
+                    continue
+                seen_edges.add(edge)
+                next_rows.append({'source_uuid': edge[0], 'target_uuid': edge[1]})
 
             integrity_ok, integrity_errors, chain_count = _validate_chain(
                 episode_rows=episode_rows,
