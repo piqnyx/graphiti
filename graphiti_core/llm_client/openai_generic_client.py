@@ -55,6 +55,27 @@ def _reasoning_kwargs() -> dict[str, Any]:
     return {'reasoning_effort': effort} if effort else {}
 
 
+def _thinking_kwargs() -> dict[str, Any]:
+    """Ask the provider to think, or not to, when it offers that as its own switch.
+
+    Measured against mimo-v2.5 through opencode.ai: with a ``response_format`` set,
+    the model stops reasoning entirely -- twelve extraction calls returned empty
+    ``reasoning_content`` and zero reasoning tokens -- and ``reasoning_effort`` does
+    not bring it back at any value. A ``thinking`` object does, alongside the same
+    ``response_format``, and the JSON still parses. Since extraction is the one
+    place where noticing that a claim was contradicted two lines later actually
+    matters, that switch is worth having.
+
+    Sent through ``extra_body`` because it is not part of the OpenAI schema. An
+    unset variable sends nothing, which is exactly the behaviour before this
+    existed; gateways that do not know the field ignore it.
+    """
+    mode = os.environ.get('GRAPHITI_THINKING', '').strip().lower()
+    if mode not in {'enabled', 'disabled'}:
+        return {}
+    return {'extra_body': {'thinking': {'type': mode}}}
+
+
 def _trace_value(value: Any) -> Any:
     """Convert SDK response objects to JSON-compatible diagnostic values."""
     if value is None or isinstance(value, (str, int, float, bool, list, dict)):
@@ -243,6 +264,7 @@ class OpenAIGenericClient(LLMClient):
             'max_tokens': max_tokens,
             'response_format': self._build_response_format(response_model),
             **_reasoning_kwargs(),
+            **_thinking_kwargs(),
         }
         trace_context = _TRACE_CONTEXT.get() or {}
         _trace_llm_event(
