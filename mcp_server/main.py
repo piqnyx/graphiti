@@ -31,6 +31,7 @@ if __name__ == '__main__':
     from piqnyx_combined_search_tool import install_search_memory_combined_tool
     from piqnyx_episode_lookup_tool import install_get_episodes_by_ref_tool
     from piqnyx_graph_stats_tool import install_get_graph_stats_tool
+    from piqnyx_merge_entities_tool import install_merge_entities_tool
     from piqnyx_queue_status_tool import install_get_queue_status_tool
     from piqnyx_saga_state_tool import install_get_saga_tool
 
@@ -41,6 +42,7 @@ if __name__ == '__main__':
     install_get_graph_stats_tool(server)
     install_get_episodes_by_ref_tool(server)
     install_search_memory_combined_tool(server)
+    install_merge_entities_tool(server)
 
     # Pass all command line arguments to the original main function
     server.main()

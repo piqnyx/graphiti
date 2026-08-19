@@ -107,6 +107,33 @@ def install_search_memory_combined_tool(server: Any) -> None:
             server.logger.error(f'Error searching memory: {exc}')
             return ErrorResponse(error=f'Error searching memory: {exc}')
 
+        # An entity does have provenance of its own -- (:Episodic)-[:MENTIONS]->(:Entity)
+        # is how the graph records where it came up. Deriving it from the facts in
+        # this result instead leaves an entity whose facts did not rank blank, which
+        # is precisely the case a reader most wants to trace.
+        entity_episodes: dict[str, list[str]] = {}
+        entity_uuids = [node.uuid for node in results.nodes]
+        if entity_uuids:
+            try:
+                rows, _, _ = await scoped_driver.execute_query(
+                    """
+                    MATCH (e:Episodic)-[:MENTIONS]->(n:Entity)
+                    WHERE n.uuid IN $uuids
+                    RETURN n.uuid AS entity_uuid, e.uuid AS episode_uuid
+                    """,
+                    uuids=entity_uuids,
+                    routing_='r',
+                )
+                for row in rows:
+                    entity_uuid = row.get('entity_uuid')
+                    episode_uuid = row.get('episode_uuid')
+                    if entity_uuid and episode_uuid:
+                        entity_episodes.setdefault(str(entity_uuid), []).append(str(episode_uuid))
+            except Exception as exc:
+                # Provenance is an aid to reading, never the answer itself; a search
+                # that found something must not fail because its sourcing did not.
+                server.logger.warning(f'Could not resolve entity provenance: {exc}')
+
         return {
             'message': f"Combined search for group '{effective_group_id}' completed",
             'group_id': effective_group_id,
@@ -116,10 +143,8 @@ def install_search_memory_combined_tool(server: Any) -> None:
                     'fact': edge.fact,
                     'score': score,
                     'episodes': list(getattr(edge, 'episodes', []) or []),
-                    # The two entities this fact connects. An entity carries no
-                    # provenance of its own, so this is the only honest way to say
-                    # which conversations it came up in: the episodes of the facts
-                    # that touch it.
+                    # The two entities this fact connects, so a reader can follow a
+                    # fact back to both of its ends.
                     'source_node_uuid': getattr(edge, 'source_node_uuid', None),
                     'target_node_uuid': getattr(edge, 'target_node_uuid', None),
                     'created_at': _iso(getattr(edge, 'created_at', None)),
@@ -135,6 +160,7 @@ def install_search_memory_combined_tool(server: Any) -> None:
                     'name': node.name,
                     'score': score,
                     'summary': getattr(node, 'summary', None),
+                    'episodes': entity_episodes.get(node.uuid, []),
                     'created_at': _iso(getattr(node, 'created_at', None)),
                 }
                 for node, score in zip(results.nodes, _scores(results.node_reranker_scores, results.nodes))
