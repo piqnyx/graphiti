@@ -89,14 +89,20 @@ async def test_defaults_to_json_schema_response_format():
 
 
 @pytest.mark.asyncio
-async def test_json_schema_mode_does_not_inject_schema_into_prompt():
+async def test_json_schema_mode_also_injects_schema_into_prompt():
+    """json_schema is a hint, not a guarantee.
+
+    Gateways that accept the response_format and then ignore it leave the prompt as the
+    only thing steering key names, so the schema is stated in both modes.
+    """
     client, completions = _make_client()
     messages = _messages()
 
     await client.generate_response(messages, response_model=ResponseModel)
 
     sent_user_content = completions.create_calls[0]['messages'][-1]['content']
-    assert 'Respond with a JSON object in the following format' not in sent_user_content
+    assert 'The following is a JSON Schema' in sent_user_content
+    assert json.dumps(ResponseModel.model_json_schema()) in sent_user_content
 
 
 @pytest.mark.asyncio
@@ -108,7 +114,8 @@ async def test_json_object_mode_uses_json_object_and_injects_schema():
     call = completions.create_calls[0]
     assert call['response_format'] == {'type': 'json_object'}
     sent_user_content = call['messages'][-1]['content']
-    assert 'Respond with a JSON object in the following format' in sent_user_content
+    assert 'The following is a JSON Schema' in sent_user_content
+    assert 'is not a template to copy' in sent_user_content
     assert json.dumps(ResponseModel.model_json_schema()) in sent_user_content
 
 
@@ -120,9 +127,7 @@ async def test_no_response_model_uses_json_object_without_injection():
 
     call = completions.create_calls[0]
     assert call['response_format'] == {'type': 'json_object'}
-    assert (
-        'Respond with a JSON object in the following format' not in call['messages'][-1]['content']
-    )
+    assert 'The following is a JSON Schema' not in call['messages'][-1]['content']
     assert result == {'any': 'thing'}
 
 

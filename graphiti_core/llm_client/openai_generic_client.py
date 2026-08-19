@@ -356,13 +356,28 @@ class OpenAIGenericClient(LLMClient):
         # llm.max_tokens setting authoritative even if a helper passes 131072.
         max_tokens = min(requested_max_tokens, self.max_tokens)
 
-        # In json_object fallback mode the API does not enforce the schema, so embed it in
-        # the prompt to guide the model. In json_schema mode the schema is enforced via
-        # response_format, so no prompt injection is needed.
-        if response_model is not None and self.structured_output_mode == 'json_object':
+        # The schema goes into the prompt in BOTH modes. Not every OpenAI-compatible
+        # gateway honours json_schema: opencode.ai/zen accepts the response_format for
+        # mimo-v2.5 and then returns whatever key names the model preferred
+        # ({"entities": ...} for ExtractedEntities, {"facts": ...} for ExtractedEdges),
+        # which fails validation on every attempt. Where json_schema is genuinely
+        # enforced the extra text is merely redundant.
+        #
+        # The wording carries as much weight as the schema itself. "Respond with a JSON
+        # object in the following format: {schema}" reads as an instruction to return
+        # that document: roughly one call in three came back as the schema, $defs and
+        # all. Naming it as a schema and demanding an instance removes that reading.
+        if response_model is not None:
             serialized_model = json.dumps(response_model.model_json_schema())
+            top_level_keys = ', '.join(response_model.model_fields)
             messages[-1].content += (
-                f'\n\nRespond with a JSON object in the following format:\n\n{serialized_model}'
+                '\n\nThe following is a JSON Schema. It describes the shape of the answer; '
+                'it is not a template to copy and it is not the answer itself:'
+                f'\n\n{serialized_model}\n\n'
+                'Reply with a single JSON object that is an instance of that schema and '
+                f'nothing else. Its top-level keys must be exactly: {top_level_keys}. '
+                'Never emit "$defs", "properties", "required", "title" or any other JSON '
+                'Schema keyword in the reply: those describe the data, they are not data.'
             )
 
         # Add multilingual extraction instructions
