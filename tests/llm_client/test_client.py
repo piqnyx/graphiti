@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from graphiti_core.llm_client.client import LLMClient
+from graphiti_core.llm_client.client import LLMClient, get_extraction_language_instruction
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.prompts.models import Message
 
@@ -106,3 +106,26 @@ def test_attribute_extraction_preamble_handles_empty_messages():
     messages: list[Message] = []
     client._apply_attribute_extraction_preamble(messages, attribute_extraction=True)
     assert messages == []
+
+
+def test_language_instruction_defaults_to_inferring_from_the_source(monkeypatch):
+    monkeypatch.delenv('GRAPHITI_OUTPUT_LANGUAGE', raising=False)
+    instruction = get_extraction_language_instruction()
+    assert 'same language as it was written in' in instruction
+    assert 'SCREAMING_SNAKE_CASE' not in instruction
+
+
+def test_a_pinned_language_still_leaves_relation_types_in_english(monkeypatch):
+    """The pinned language is prose only.
+
+    Search and every downstream consumer match on relation types, so a type in the
+    source script is unusable. This test exists because saying "keep them English"
+    was not enough on its own: a word with no English equivalent left the model
+    choosing which of two instructions to break.
+    """
+    monkeypatch.setenv('GRAPHITI_OUTPUT_LANGUAGE', 'Russian')
+    instruction = get_extraction_language_instruction()
+    assert 'Russian' in instruction
+    assert 'SCREAMING_SNAKE_CASE' in instruction
+    # Both branches, or the impossible case is unaddressed again.
+    assert 'LIKES' in instruction and 'KHACHAPURI' in instruction

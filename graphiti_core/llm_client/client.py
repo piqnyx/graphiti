@@ -62,12 +62,24 @@ def get_extraction_language_instruction(group_id: str | None = None) -> str:
         # Only prose is pinned. Names stay as written -- a product is not translated
         # -- and relation types stay the SCREAMING_SNAKE_CASE identifiers the prompts
         # ask for, since search and every downstream consumer match on them.
+        #
+        # Saying that much was not enough. Measured on a live graph, 8 of 195 edges
+        # came back as ЛЮБИТ, ПРИДУМАЛ, and the hybrid PERFORMS_ВИЗАРАН_TO: told to
+        # write everything in one language and to keep types English, the model met
+        # a word it could not translate and broke the rule it had no way to keep.
+        # Both branches are therefore spelled out -- translate the ordinary word,
+        # transliterate the name that has no English form -- because the rule the
+        # model was missing was what to do when translation is impossible.
         return (
             f'\n\nWrite every human-readable field -- facts, summaries, descriptions -- in {configured}, '
             'whatever language the source used. '
             'Keep proper nouns, product names, file names and identifiers exactly as they appear in the source; '
             'do not translate or transliterate them. '
-            'Relationship type names remain English SCREAMING_SNAKE_CASE regardless of this setting.'
+            'Relationship type names are the one exception: they stay English '
+            'SCREAMING_SNAKE_CASE whatever this setting says. Translate the words rather '
+            'than transcribing them (LIKES, never ЛЮБИТ), and transliterate only a name '
+            'that has no English form at all (SERVES_KHACHAPURI, never SERVES_ХАЧАПУРИ). '
+            'A type written in the source script is always wrong.'
         )
 
     return (
