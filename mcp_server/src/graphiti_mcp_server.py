@@ -17,6 +17,10 @@ from dotenv import load_dotenv
 from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode, EpisodeType, SagaNode
+from graphiti_core.search.search_config_recipes import (
+    EDGE_HYBRID_SEARCH_NODE_DISTANCE,
+    EDGE_HYBRID_SEARCH_RRF,
+)
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
@@ -625,13 +629,42 @@ async def search_memory_facts(
             else []
         )
 
-        relevant_edges = await client.search(
-            group_ids=effective_group_ids,
+        # Scoped like every other tool that reads this graph. `Graphiti.search`
+        # takes no driver, so it queries whatever database the shared driver was
+        # built with -- while `add_memory` clones to `database=group_id`. Facts for
+        # any agent but the one the server was configured with are therefore
+        # written to their own graph and searched for in somebody else's, where the
+        # group_id filter then matches nothing. Recall for those agents returns
+        # empty forever, and silently.
+        #
+        # Only a single group can be scoped: a database is one graph. A caller
+        # asking across several keeps the shared driver, which is the old
+        # behaviour and the old bug, but narrowing it would be a different answer
+        # to a different question.
+        scoped_driver = (
+            client.driver.clone(database=effective_group_ids[0])
+            if len(effective_group_ids) == 1
+            else None
+        )
+
+        # Copied rather than mutated. `Graphiti.search` assigns num_results onto
+        # the module-level recipe object, which every concurrent request shares:
+        # a manual search asking for fifty rewrites the limit that a recall asking
+        # for eight is about to read.
+        recipe = (
+            EDGE_HYBRID_SEARCH_RRF if center_node_uuid is None else EDGE_HYBRID_SEARCH_NODE_DISTANCE
+        )
+        config_copy = recipe.model_copy(deep=True, update={'limit': max_facts})
+
+        results = await client.search_(
             query=query,
-            num_results=max_facts,
+            config=config_copy,
+            group_ids=effective_group_ids,
             center_node_uuid=center_node_uuid,
             search_filter=search_filter,
+            driver=scoped_driver,
         )
+        relevant_edges = results.edges
 
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])
