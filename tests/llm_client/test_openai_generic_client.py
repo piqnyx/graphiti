@@ -7,7 +7,11 @@ from pydantic import BaseModel
 
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.errors import EmptyResponseError, OutputLimitError, RateLimitError
-from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+from graphiti_core.llm_client.openai_generic_client import (
+    _TRACE_CONTEXT,
+    OpenAIGenericClient,
+    _thinking_kwargs,
+)
 from graphiti_core.prompts.models import Message
 
 
@@ -259,7 +263,12 @@ async def test_exact_jsonl_trace_records_real_request_and_raw_response(tmp_path,
     assert request['request']['temperature'] == client.temperature
     assert request['request']['reasoning_effort'] == 'none'
     assert request['request']['response_format']['type'] == 'json_schema'
-    assert request['request']['messages'][-1] == {'role': 'user', 'content': 'user message'}
+    # The prompt carries the schema as prose as well as in ``response_format``,
+    # because the gateways this client targets accept the field and ignore it.
+    last = request['request']['messages'][-1]
+    assert last['role'] == 'user'
+    assert last['content'].startswith('user message')
+    assert 'JSON Schema' in last['content']
 
     response = records[1]
     assert response['request_id'] == request['request_id']
@@ -292,3 +301,60 @@ async def test_non_retryable_error_is_not_retried():
         await client.generate_response(_messages(), response_model=ResponseModel)
 
     assert len(completions.create_calls) == 1
+
+
+def _with_prompt(name: str):
+    """Enter the tracing context the request builder reads the stage name from."""
+    return _TRACE_CONTEXT.set({'prompt_name': name})
+
+
+def test_thinking_mode_without_overrides_is_the_global_one(monkeypatch):
+    monkeypatch.setenv('GRAPHITI_THINKING', 'enabled')
+    monkeypatch.delenv('GRAPHITI_THINKING_BY_PROMPT', raising=False)
+    token = _with_prompt('dedupe_nodes.nodes')
+    try:
+        assert _thinking_kwargs() == {'extra_body': {'thinking': {'type': 'enabled'}}}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_a_matching_stage_override_wins_over_the_global_mode(monkeypatch):
+    monkeypatch.setenv('GRAPHITI_THINKING', 'enabled')
+    monkeypatch.setenv('GRAPHITI_THINKING_BY_PROMPT', 'dedupe_nodes=disabled')
+    token = _with_prompt('dedupe_nodes.nodes')
+    try:
+        assert _thinking_kwargs() == {'extra_body': {'thinking': {'type': 'disabled'}}}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_a_stage_the_overrides_do_not_name_keeps_the_global_mode(monkeypatch):
+    monkeypatch.setenv('GRAPHITI_THINKING', 'enabled')
+    monkeypatch.setenv('GRAPHITI_THINKING_BY_PROMPT', 'dedupe_nodes=disabled')
+    token = _with_prompt('dedupe_edges.resolve_edge')
+    try:
+        assert _thinking_kwargs() == {'extra_body': {'thinking': {'type': 'enabled'}}}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_overrides_are_ignored_when_the_stage_is_unknown(monkeypatch):
+    """No prompt name means no way to tell the stages apart, so the global mode stands."""
+    monkeypatch.setenv('GRAPHITI_THINKING', 'enabled')
+    monkeypatch.setenv('GRAPHITI_THINKING_BY_PROMPT', 'dedupe_nodes=disabled')
+    token = _TRACE_CONTEXT.set(None)
+    try:
+        assert _thinking_kwargs() == {'extra_body': {'thinking': {'type': 'enabled'}}}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_an_unset_switch_still_sends_nothing(monkeypatch):
+    """The behaviour before any of this existed, and the one gateways expect."""
+    monkeypatch.delenv('GRAPHITI_THINKING', raising=False)
+    monkeypatch.setenv('GRAPHITI_THINKING_BY_PROMPT', 'dedupe_nodes=nonsense')
+    token = _with_prompt('dedupe_nodes.nodes')
+    try:
+        assert _thinking_kwargs() == {}
+    finally:
+        _TRACE_CONTEXT.reset(token)
