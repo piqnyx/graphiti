@@ -449,8 +449,14 @@ class CrossEncoderFactory:
             from graphiti_core.cross_encoder.http_reranker_client import HTTPRerankerClient
 
             timeout_s = float(os.environ.get('GRAPHITI_RERANKER_TIMEOUT_S', '30'))
+            api_key = os.environ.get('GRAPHITI_RERANKER_API_KEY', '').strip()
             logger.info('Using HTTPRerankerClient at %s (model %s)', reranker_url, reranker_model)
-            return HTTPRerankerClient(url=reranker_url, model=reranker_model, timeout_s=timeout_s)
+            return HTTPRerankerClient(
+                url=reranker_url,
+                model=reranker_model,
+                api_key=api_key or None,
+                timeout_s=timeout_s,
+            )
 
         # Try the LLM provider first, then the embedder, before falling back to a local model.
         for source, config in (('LLM', llm_config), ('embedder', embedder_config)):

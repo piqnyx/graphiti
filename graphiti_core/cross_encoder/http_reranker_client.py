@@ -35,17 +35,20 @@ class HTTPRerankerClient(CrossEncoderClient):
     second copy costs its own memory and its own startup, to answer the same
     question the first copy is idle for.
 
-    Scores are passed through exactly as the server reported them. bge rerankers
-    return raw logits -- roughly +5 for a passage that answers the query and -10
-    for one that does not -- and ``reranker_min_score`` filters on ``>=``, so the
-    default of 0 already means "keep what is relevant". Normalising here would
-    move that boundary somewhere unmemorable for no gain.
+    Scores are passed through exactly as the server reported them, and the scale
+    is the server's own. A bge reranker returns raw logits -- roughly +5 for a
+    passage that answers the query and -10 for one that does not -- so
+    ``reranker_min_score`` at its default of 0 already means "keep what is
+    relevant". A hosted reranker in the Cohere shape returns 0..1 instead, where 0
+    keeps everything and the useful floor has to be measured. Normalising one into
+    the other would hide which of those two a deployment is talking to.
     """
 
     def __init__(
         self,
         url: str,
         model: str,
+        api_key: str | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         client: httpx.AsyncClient | None = None,
     ):
@@ -55,6 +58,7 @@ class HTTPRerankerClient(CrossEncoderClient):
             raise ValueError('HTTPRerankerClient needs a model name')
         self.url = url
         self.model = model
+        self.api_key = api_key or None
         self.timeout_s = timeout_s
         self._client = client
 
@@ -69,9 +73,14 @@ class HTTPRerankerClient(CrossEncoderClient):
             'top_n': len(passages),
         }
 
+        # Absent for a local server, required by a hosted one. Sent only when
+        # there is one, so a llama.cpp on the loopback is not handed a bearer
+        # token it never asked for.
+        headers = {'Authorization': f'Bearer {self.api_key}'} if self.api_key else None
+
         client = self._client or httpx.AsyncClient(timeout=self.timeout_s)
         try:
-            response = await client.post(self.url, json=payload)
+            response = await client.post(self.url, json=payload, headers=headers)
             response.raise_for_status()
             body = response.json()
         finally:

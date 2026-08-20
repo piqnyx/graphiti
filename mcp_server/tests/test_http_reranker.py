@@ -140,3 +140,32 @@ def test_a_url_without_a_model_refuses_rather_than_falling_through(monkeypatch):
 
     with pytest.raises(ValueError, match='GRAPHITI_RERANKER_MODEL'):
         CrossEncoderFactory.create(Mock(), Mock())
+
+
+@pytest.mark.asyncio
+async def test_a_hosted_reranker_is_given_its_key():
+    seen: list[httpx.Request] = []
+    payload = {'results': [{'index': 0, 'relevance_score': 0.91}]}
+    client = HTTPRerankerClient(
+        url='https://openrouter.ai/api/v1/rerank',
+        model='cohere/rerank-v3.5',
+        api_key='sk-test',
+        client=_server(payload, seen),
+    )
+
+    await client.rank('где живёт Вит', ['Вит живёт в Григолети'])
+
+    assert seen[0].headers['authorization'] == 'Bearer sk-test'
+
+
+@pytest.mark.asyncio
+async def test_a_local_server_is_not_handed_a_token_it_never_asked_for():
+    seen: list[httpx.Request] = []
+    payload = {'results': [{'index': 0, 'relevance_score': 5.4}]}
+    client = HTTPRerankerClient(
+        url='http://127.0.0.1:18080/v1/rerank', model='bge', client=_server(payload, seen)
+    )
+
+    await client.rank('где живёт Вит', ['Вит живёт в Григолети'])
+
+    assert 'authorization' not in seen[0].headers
