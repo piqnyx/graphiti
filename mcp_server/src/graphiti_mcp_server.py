@@ -18,6 +18,7 @@ from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode, EpisodeType, SagaNode
 from graphiti_core.search.search_config_recipes import (
+    EDGE_HYBRID_SEARCH_CROSS_ENCODER,
     EDGE_HYBRID_SEARCH_NODE_DISTANCE,
     EDGE_HYBRID_SEARCH_RRF,
 )
@@ -579,6 +580,9 @@ async def search_memory_facts(
     valid_at_before: str | None = None,
     invalid_at_after: str | None = None,
     invalid_at_before: str | None = None,
+    pool: int | None = None,
+    rerank: bool = False,
+    min_score: float | None = None,
 ) -> FactSearchResponse | ErrorResponse:
     """Search the graph memory for relevant facts (entity edges).
 
@@ -594,6 +598,18 @@ async def search_memory_facts(
         valid_at_before: Optional ISO-8601 upper bound on a fact's valid_at
         invalid_at_after: Optional ISO-8601 lower bound on a fact's invalid_at
         invalid_at_before: Optional ISO-8601 upper bound on a fact's invalid_at
+        pool: How many candidates to examine before choosing max_facts of them.
+            Defaults to max_facts, which is what retrieval did while the two were
+            one number: each search method fetches 2 * limit, so asking for eight
+            facts looked at sixteen candidates and nothing below that depth could
+            be found at all. Widening it searches deeper without saying more.
+        rerank: Score the candidates with the configured cross-encoder against this
+            query rather than fusing the search methods by rank. Needs a
+            cross-encoder configured -- see GRAPHITI_RERANKER_URL.
+        min_score: Drop candidates scoring below this. The scale belongs to
+            whichever reranker ran: rank fusion yields small positive numbers, a bge
+            cross-encoder yields logits either side of zero. An empty result is a
+            real answer -- the graph holds nothing that clears the floor.
     """
     global graphiti_service
 
@@ -651,10 +667,35 @@ async def search_memory_facts(
         # the module-level recipe object, which every concurrent request shares:
         # a manual search asking for fifty rewrites the limit that a recall asking
         # for eight is about to read.
-        recipe = (
-            EDGE_HYBRID_SEARCH_RRF if center_node_uuid is None else EDGE_HYBRID_SEARCH_NODE_DISTANCE
-        )
-        config_copy = recipe.model_copy(deep=True, update={'limit': max_facts})
+        if rerank:
+            # Refused rather than served by whatever the factory finds. Its search
+            # starts at the LLM provider, so on an OpenAI-shaped configuration it
+            # returns a reranker that spends one chat completion per candidate
+            # against the LLM gateway -- a bill per turn that no parameter here
+            # hints at. An explicit reranker is the only kind worth reranking with.
+            if not os.environ.get('GRAPHITI_RERANKER_URL', '').strip():
+                return ErrorResponse(
+                    error='rerank requires a cross-encoder: set GRAPHITI_RERANKER_URL '
+                    '(and GRAPHITI_RERANKER_MODEL). Without one the provider default '
+                    'is a paid per-passage reranker, which is not what this asked for.'
+                )
+            recipe = EDGE_HYBRID_SEARCH_CROSS_ENCODER
+        elif center_node_uuid is None:
+            recipe = EDGE_HYBRID_SEARCH_RRF
+        else:
+            recipe = EDGE_HYBRID_SEARCH_NODE_DISTANCE
+
+        # The pool is the recipe's limit, and max_facts is applied afterwards. They
+        # were one number, and that is why nothing could be found below depth
+        # sixteen. Under the cross-encoder recipe the same number decides how many
+        # candidates get scored: the ranker is handed `[:limit]` of the pool, so a
+        # limit equal to the answer size would rerank exactly the eight that the
+        # weaker ordering already chose, which is no reranking at all.
+        candidate_limit = pool if pool and pool > 0 else max_facts
+        update: dict[str, object] = {'limit': candidate_limit}
+        if min_score is not None:
+            update['reranker_min_score'] = min_score
+        config_copy = recipe.model_copy(deep=True, update=update)
 
         results = await client.search_(
             query=query,
@@ -664,12 +705,21 @@ async def search_memory_facts(
             search_filter=search_filter,
             driver=scoped_driver,
         )
-        relevant_edges = results.edges
+        relevant_edges = results.edges[:max_facts]
+        # Scores are parallel to edges before the slice, and are what makes an empty
+        # answer readable: "nothing scored above the floor" and "the search found
+        # nothing" are different failures and look identical without them.
+        scores = results.edge_reranker_scores[:max_facts]
 
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])
 
-        facts = [format_fact_result(edge) for edge in relevant_edges]
+        facts = []
+        for position, edge in enumerate(relevant_edges):
+            fact = format_fact_result(edge)
+            if position < len(scores):
+                fact['score'] = scores[position]
+            facts.append(fact)
         return FactSearchResponse(message='Facts retrieved successfully', facts=facts)
     except Exception as e:
         error_msg = str(e)
