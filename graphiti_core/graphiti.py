@@ -1665,12 +1665,20 @@ class Graphiti:
         bfs_origin_node_uuids: list[str] | None = None,
         search_filter: SearchFilters | None = None,
         driver: GraphDriver | None = None,
+        query_vector: list[float] | None = None,
     ) -> SearchResults:
         """search_ (replaces _search) is our advanced search method that returns Graph objects (nodes and edges) rather
         than a list of facts. This endpoint allows the end user to utilize more advanced features such as filters and
         different search and reranker methodologies across different layers in the graph.
 
         For different config recipes refer to search/search_config_recipes.
+
+        `query_vector` retrieves by one text while `query` ranks by another. The
+        two questions differ: finding candidates wants the conversation around a
+        remark, since a remark like "and this repository?" names nothing on its
+        own, while ranking them wants the remark alone -- a cross-encoder handed
+        the surrounding transcript scores everything the transcript mentions.
+        Left unset the query is embedded as before and both are the same text.
         """
 
         return await search(
@@ -1681,6 +1689,7 @@ class Graphiti:
             search_filter if search_filter is not None else SearchFilters(),
             center_node_uuid,
             bfs_origin_node_uuids,
+            query_vector=query_vector,
             driver=driver,
         )
 

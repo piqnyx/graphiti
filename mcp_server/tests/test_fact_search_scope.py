@@ -159,3 +159,55 @@ async def test_reranking_without_a_configured_cross_encoder_is_refused(monkeypat
 
     assert 'GRAPHITI_RERANKER_URL' in result['error']
     client.search_.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_focus_ranks_by_the_remark_and_retrieves_by_the_context(monkeypatch):
+    """One text finds candidates, another chooses among them.
+
+    Measured: a cross-encoder handed 1237 characters of transcript scored every
+    fact mentioned in it around 0.5 and could separate none of them; the same
+    reranker given the closing question alone scored everything below 0.07 --
+    correctly, because the graph held no answer to that question.
+    """
+    client, _ = _install_client(monkeypatch)
+    client.embedder.create = AsyncMock(return_value=[0.1, 0.2, 0.3])
+    monkeypatch.setenv('GRAPHITI_RERANKER_URL', 'http://127.0.0.1:18080/v1/rerank')
+
+    await graphiti_mcp_server.search_memory_facts(
+        query='длинная стенограмма разговора',
+        group_ids='main',
+        rerank=True,
+        focus='а если бы нам надо было работать с этим репозиторием?',
+    )
+
+    kwargs = client.search_.await_args.kwargs
+    assert kwargs['query'] == 'а если бы нам надо было работать с этим репозиторием?'
+    assert kwargs['query_vector'] == [0.1, 0.2, 0.3]
+    client.embedder.create.assert_awaited_once_with(input_data=['длинная стенограмма разговора'])
+
+
+@pytest.mark.asyncio
+async def test_without_focus_nothing_is_embedded_twice(monkeypatch):
+    """The search embeds the query itself; doing it here as well would pay twice."""
+    client, _ = _install_client(monkeypatch)
+    client.embedder.create = AsyncMock()
+
+    await graphiti_mcp_server.search_memory_facts(query='кукуруза', group_ids='main')
+
+    assert client.search_.await_args.kwargs['query_vector'] is None
+    client.embedder.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_focus_without_rerank_is_ignored(monkeypatch):
+    """Rank fusion has nothing to rank by, so a focus would only misdirect retrieval."""
+    client, _ = _install_client(monkeypatch)
+    client.embedder.create = AsyncMock()
+
+    await graphiti_mcp_server.search_memory_facts(
+        query='длинная стенограмма', group_ids='main', focus='короткий вопрос'
+    )
+
+    assert client.search_.await_args.kwargs['query'] == 'длинная стенограмма'
+    assert client.search_.await_args.kwargs['query_vector'] is None

@@ -583,6 +583,7 @@ async def search_memory_facts(
     pool: int | None = None,
     rerank: bool = False,
     min_score: float | None = None,
+    focus: str | None = None,
 ) -> FactSearchResponse | ErrorResponse:
     """Search the graph memory for relevant facts (entity edges).
 
@@ -610,6 +611,14 @@ async def search_memory_facts(
             whichever reranker ran: rank fusion yields small positive numbers, a bge
             cross-encoder yields logits either side of zero. An empty result is a
             real answer -- the graph holds nothing that clears the floor.
+        focus: What to rank by, when that differs from what to search by. Candidates
+            are found by embedding `query` and selected by scoring them against
+            `focus`. Use it when `query` carries conversation for context and
+            `focus` is the remark actually being answered: measured here, a
+            cross-encoder handed 1237 characters of transcript scored every fact in
+            it around 0.5 and could not separate them, while the same reranker given
+            the closing question alone scored everything below 0.07 -- correctly,
+            since the graph held no answer to it. Ignored without rerank.
     """
     global graphiti_service
 
@@ -697,13 +706,23 @@ async def search_memory_facts(
             update['reranker_min_score'] = min_score
         config_copy = recipe.model_copy(deep=True, update=update)
 
+        # Retrieval and ranking are asked different questions when `focus` is given:
+        # the vector comes from the context, the text handed to the reranker is the
+        # remark itself. Embedded here rather than in the search so that the search
+        # is given a vector and a text that deliberately disagree.
+        rank_text = focus if (focus and rerank) else query
+        query_vector = (
+            await client.embedder.create(input_data=[query]) if rank_text is not query else None
+        )
+
         results = await client.search_(
-            query=query,
+            query=rank_text,
             config=config_copy,
             group_ids=effective_group_ids,
             center_node_uuid=center_node_uuid,
             search_filter=search_filter,
             driver=scoped_driver,
+            query_vector=query_vector,
         )
         relevant_edges = results.edges[:max_facts]
         # Scores are parallel to edges before the slice, and are what makes an empty
