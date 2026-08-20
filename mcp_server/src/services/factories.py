@@ -422,8 +422,35 @@ class CrossEncoderFactory:
     def create(llm_config: LLMConfig, embedder_config: EmbedderConfig) -> CrossEncoderClient:
         """Create a cross-encoder client based on the configured providers."""
         import logging
+        import os
 
         logger = logging.getLogger(__name__)
+
+        # An explicitly configured reranker wins, and is asked for by URL alone.
+        #
+        # It is checked before the provider search rather than inside it because
+        # of what that search does here: the LLM provider is `openai`, so it
+        # returns OpenAIRerankerClient built with no `model=`, which defaults to
+        # gpt-4.1-nano and spends one chat completion per passage against
+        # whatever gateway the LLM key points at. Enabling a cross-encoder recipe
+        # without this branch is therefore not a local, free operation -- it is a
+        # paid call for every candidate on every turn, and nothing says so.
+        #
+        # Unset changes nothing: the provider search below runs exactly as before.
+        reranker_url = os.environ.get('GRAPHITI_RERANKER_URL', '').strip()
+        if reranker_url:
+            reranker_model = os.environ.get('GRAPHITI_RERANKER_MODEL', '').strip()
+            if not reranker_model:
+                raise ValueError(
+                    'GRAPHITI_RERANKER_URL is set but GRAPHITI_RERANKER_MODEL is not. '
+                    'Falling back silently would reach a paid per-passage reranker; '
+                    'name the model the server serves instead.'
+                )
+            from graphiti_core.cross_encoder.http_reranker_client import HTTPRerankerClient
+
+            timeout_s = float(os.environ.get('GRAPHITI_RERANKER_TIMEOUT_S', '30'))
+            logger.info('Using HTTPRerankerClient at %s (model %s)', reranker_url, reranker_model)
+            return HTTPRerankerClient(url=reranker_url, model=reranker_model, timeout_s=timeout_s)
 
         # Try the LLM provider first, then the embedder, before falling back to a local model.
         for source, config in (('LLM', llm_config), ('embedder', embedder_config)):
