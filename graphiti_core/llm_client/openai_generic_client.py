@@ -69,11 +69,52 @@ def _thinking_kwargs() -> dict[str, Any]:
     Sent through ``extra_body`` because it is not part of the OpenAI schema. An
     unset variable sends nothing, which is exactly the behaviour before this
     existed; gateways that do not know the field ignore it.
+
+    Reasoning is not uniformly good, which is why the mode is resolvable per
+    stage. Measured 2026-08-20 by replaying recorded requests -- same input, only
+    this variable changed. The contradiction judge (``dedupe_edges.resolve_edge``)
+    scored 9 of 15 labelled cases without reasoning and 14 of 15 with it, failing
+    exactly where getzep/graphiti#1666 reports non-reasoning judges failing:
+    contradictions away from index 0, and indices from the second list. Entity
+    deduplication (``dedupe_nodes``) moves the other way, and worse than "worse":
+    on one recorded 38-entity call, one reasoning run of two returned sixteen
+    merges of which fifteen were ``duplicate_candidate_id == id`` -- the model
+    copying the row number instead of choosing -- while four non-reasoning runs
+    returned none. It is a lottery rather than a steady fault, so half the batches
+    arrive fine and half quietly attach facts to unrelated entities.
+
+    ``GRAPHITI_THINKING_BY_PROMPT`` therefore takes ``prefix=mode`` pairs matched
+    against the prompt name, e.g. ``dedupe_nodes=disabled``, and falls back to
+    ``GRAPHITI_THINKING`` for everything else.
     """
-    mode = os.environ.get('GRAPHITI_THINKING', '').strip().lower()
+    mode = _thinking_mode()
     if mode not in {'enabled', 'disabled'}:
         return {}
     return {'extra_body': {'thinking': {'type': mode}}}
+
+
+def _thinking_mode() -> str:
+    """The reasoning mode for the call in flight, per stage when asked.
+
+    The prompt name is read from the trace context rather than threaded through
+    the request builder: it is already set there for tracing, one frame above,
+    and the alternative is a parameter on every call site for one switch.
+    """
+    default = os.environ.get('GRAPHITI_THINKING', '').strip().lower()
+    overrides = os.environ.get('GRAPHITI_THINKING_BY_PROMPT', '').strip()
+    if not overrides:
+        return default
+
+    prompt_name = str((_TRACE_CONTEXT.get() or {}).get('prompt_name') or '')
+    if not prompt_name:
+        return default
+
+    for pair in overrides.split(','):
+        prefix, sep, mode = pair.partition('=')
+        prefix = prefix.strip()
+        if sep and prefix and prompt_name.startswith(prefix):
+            return mode.strip().lower()
+    return default
 
 
 def _trace_value(value: Any) -> Any:
