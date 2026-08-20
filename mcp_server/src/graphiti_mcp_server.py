@@ -569,6 +569,52 @@ async def search_nodes(
         return ErrorResponse(error=f'Error searching nodes: {error_msg}')
 
 
+async def _rank_candidates(
+    cross_encoder,
+    candidates: list,
+    focus: str,
+    context: str,
+    context_weight: float,
+    min_score: float | None,
+    max_facts: int,
+) -> tuple[list, list[float]]:
+    """Score candidates by the remark, and by the conversation when asked.
+
+    Two passes rather than one because the remark and the conversation fail in
+    opposite directions. Measured on a live graph: asked "что там у меня за диски
+    стоят?", scoring by the remark put the right fact first at 0.146 with the next
+    candidate at 0.046, while scoring by the surrounding transcript buried it under
+    facts the transcript merely mentioned. Asked "далеко это от меня вообще?" --
+    a remark with no word to rank by -- scoring by the remark spread every fact
+    across a single hundredth, while the conversation knew that "это" was Poti.
+
+    The two are combined by taking the better of them, with the conversation
+    discounted, rather than by averaging. Averaging lets a fact the remark
+    genuinely matches be pulled down by talk it has nothing to do with; the
+    discount says the conversation may rescue a candidate the remark cannot judge,
+    but never outranks one the remark actually recognised.
+    """
+    if not candidates:
+        return [], []
+
+    passages = [edge.fact for edge in candidates]
+    by_focus = dict(await cross_encoder.rank(focus, passages))
+    by_context = dict(await cross_encoder.rank(context, passages)) if context_weight > 0 else {}
+
+    scored = []
+    for edge in candidates:
+        score = by_focus.get(edge.fact, float('-inf'))
+        if context_weight > 0:
+            score = max(score, by_context.get(edge.fact, float('-inf')) * context_weight)
+        if min_score is not None and score < min_score:
+            continue
+        scored.append((edge, score))
+
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    kept = scored[:max_facts]
+    return [edge for edge, _ in kept], [score for _, score in kept]
+
+
 @mcp.tool()
 async def search_memory_facts(
     query: str,
@@ -584,6 +630,7 @@ async def search_memory_facts(
     rerank: bool = False,
     min_score: float | None = None,
     focus: str | None = None,
+    context_weight: float = 0.0,
 ) -> FactSearchResponse | ErrorResponse:
     """Search the graph memory for relevant facts (entity edges).
 
@@ -619,6 +666,14 @@ async def search_memory_facts(
             it around 0.5 and could not separate them, while the same reranker given
             the closing question alone scored everything below 0.07 -- correctly,
             since the graph held no answer to it. Ignored without rerank.
+        context_weight: How much a candidate's score against `query` counts when it
+            beats its score against `focus`. Zero means the remark decides alone,
+            which is right until the remark says nothing on its own: "далеко это от
+            меня вообще?" carries no word to rank by, and scoring by it alone put
+            every fact within a hundredth of every other. The context knows what
+            "это" was. Discounted rather than averaged, so a fact the remark
+            actually matches cannot be displaced by one the surrounding talk merely
+            mentions. Costs a second ranking pass.
     """
     global graphiti_service
 
@@ -715,20 +770,44 @@ async def search_memory_facts(
             await client.embedder.create(input_data=[query]) if rank_text is not query else None
         )
 
-        results = await client.search_(
-            query=rank_text,
-            config=config_copy,
-            group_ids=effective_group_ids,
-            center_node_uuid=center_node_uuid,
-            search_filter=search_filter,
-            driver=scoped_driver,
-            query_vector=query_vector,
-        )
-        relevant_edges = results.edges[:max_facts]
-        # Scores are parallel to edges before the slice, and are what makes an empty
-        # answer readable: "nothing scored above the floor" and "the search found
-        # nothing" are different failures and look identical without them.
-        scores = results.edge_reranker_scores[:max_facts]
+        if focus and rerank:
+            # Ranked here rather than inside the search, for two reasons. The
+            # candidates may be scored twice -- against the remark and against the
+            # conversation -- and the search ranks once by construction. And the
+            # cross-encoder recipe hands the ranker `[:limit]` of the pool, so
+            # scoring the whole pool means holding it.
+            retrieval = EDGE_HYBRID_SEARCH_RRF.model_copy(
+                deep=True, update={'limit': candidate_limit}
+            )
+            results = await client.search_(
+                query=rank_text,
+                config=retrieval,
+                group_ids=effective_group_ids,
+                center_node_uuid=center_node_uuid,
+                search_filter=search_filter,
+                driver=scoped_driver,
+                query_vector=query_vector,
+            )
+            candidates = results.edges
+            relevant_edges, scores = await _rank_candidates(
+                client.cross_encoder, candidates, focus, query, context_weight, min_score, max_facts
+            )
+        else:
+            results = await client.search_(
+                query=rank_text,
+                config=config_copy,
+                group_ids=effective_group_ids,
+                center_node_uuid=center_node_uuid,
+                search_filter=search_filter,
+                driver=scoped_driver,
+                query_vector=query_vector,
+            )
+            relevant_edges = results.edges[:max_facts]
+            # Scores are parallel to edges before the slice, and are what makes an
+            # empty answer readable: "nothing scored above the floor" and "the
+            # search found nothing" are different failures and look identical
+            # without them.
+            scores = results.edge_reranker_scores[:max_facts]
 
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])

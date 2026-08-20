@@ -211,3 +211,101 @@ async def test_focus_without_rerank_is_ignored(monkeypatch):
 
     assert client.search_.await_args.kwargs['query'] == 'длинная стенограмма'
     assert client.search_.await_args.kwargs['query_vector'] is None
+
+
+class _Edge:
+    def __init__(self, fact):
+        self.fact = fact
+
+
+class _Ranker:
+    """A cross-encoder with an opinion, recorded per query."""
+
+    def __init__(self, opinions):
+        self.opinions = opinions
+        self.asked: list[str] = []
+
+    async def rank(self, query, passages):
+        self.asked.append(query)
+        scores = self.opinions[query]
+        return sorted(
+            ((p, scores.get(p, 0.0)) for p in passages), key=lambda pair: pair[1], reverse=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_conversation_rescues_what_the_remark_cannot_judge():
+    """ "далеко это от меня вообще?" carries no word to rank by.
+
+    Measured: scoring by that remark alone spread every fact across a single
+    hundredth. The conversation knows that "это" was Poti.
+    """
+    edges = [_Edge('Вит живёт рядом с городом Поти'), _Edge('Вит ел пиде в Terminal Pide.')]
+    ranker = _Ranker(
+        {
+            'далеко это?': {
+                'Вит живёт рядом с городом Поти': 0.03,
+                'Вит ел пиде в Terminal Pide.': 0.02,
+            },
+            'разговор про банк в Поти': {
+                'Вит живёт рядом с городом Поти': 0.44,
+                'Вит ел пиде в Terminal Pide.': 0.01,
+            },
+        }
+    )
+
+    kept, scores = await graphiti_mcp_server._rank_candidates(
+        ranker, edges, 'далеко это?', 'разговор про банк в Поти', 0.5, 0.08, 6
+    )
+
+    assert [edge.fact for edge in kept] == ['Вит живёт рядом с городом Поти']
+    assert scores[0] == pytest.approx(0.22)
+
+
+@pytest.mark.asyncio
+async def test_the_conversation_never_outranks_what_the_remark_recognised():
+    """Discounted, not averaged: talk a fact has nothing to do with must not sink it."""
+    edges = [_Edge('диски Samsung 990'), _Edge('Эва имеет доступ к strace')]
+    ranker = _Ranker(
+        {
+            'что там за диски': {'диски Samsung 990': 0.15, 'Эва имеет доступ к strace': 0.01},
+            'долгий разговор про песочницу': {
+                'диски Samsung 990': 0.0,
+                'Эва имеет доступ к strace': 0.9,
+            },
+        }
+    )
+
+    kept, _ = await graphiti_mcp_server._rank_candidates(
+        ranker, edges, 'что там за диски', 'долгий разговор про песочницу', 0.1, None, 6
+    )
+
+    assert kept[0].fact == 'диски Samsung 990'
+
+
+@pytest.mark.asyncio
+async def test_a_zero_weight_asks_the_conversation_nothing():
+    """One ranking pass costs one request; the second is bought, not assumed."""
+    edges = [_Edge('диски Samsung 990')]
+    ranker = _Ranker({'что там за диски': {'диски Samsung 990': 0.15}})
+
+    await graphiti_mcp_server._rank_candidates(
+        ranker, edges, 'что там за диски', 'контекст', 0.0, None, 6
+    )
+
+    assert ranker.asked == ['что там за диски']
+
+
+@pytest.mark.asyncio
+async def test_everything_below_the_floor_leaves_nothing_to_say():
+    """The graph holding no answer is an answer, and the only one worth giving."""
+    edges = [_Edge('Вит ел пиде'), _Edge('Эва отредактировала USER.md')]
+    ranker = _Ranker(
+        {'какая у меня термопаста': {'Вит ел пиде': 0.02, 'Эва отредактировала USER.md': 0.026}}
+    )
+
+    kept, scores = await graphiti_mcp_server._rank_candidates(
+        ranker, edges, 'какая у меня термопаста', 'контекст', 0.0, 0.08, 6
+    )
+
+    assert kept == [] and scores == []
