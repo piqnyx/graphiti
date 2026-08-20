@@ -255,11 +255,13 @@ async def test_the_conversation_rescues_what_the_remark_cannot_judge():
     )
 
     kept, scores = await graphiti_mcp_server._rank_candidates(
-        ranker, edges, 'далеко это?', 'разговор про банк в Поти', 0.5, 0.08, 6
+        ranker, edges, 'далеко это?', 'разговор про банк в Поти', 0.3, 0.08, 6
     )
 
     assert [edge.fact for edge in kept] == ['Вит живёт рядом с городом Поти']
-    assert scores[0] == pytest.approx(0.22)
+    # Reported as the second pass scored it, not rescaled: the number a caller
+    # sees is the one its own floor was compared against.
+    assert scores[0] == pytest.approx(0.44)
 
 
 @pytest.mark.asyncio
@@ -305,7 +307,125 @@ async def test_everything_below_the_floor_leaves_nothing_to_say():
     )
 
     kept, scores = await graphiti_mcp_server._rank_candidates(
-        ranker, edges, 'какая у меня термопаста', 'контекст', 0.0, 0.08, 6
+        ranker, edges, 'какая у меня термопаста', 'контекст', None, 0.08, 6
     )
 
     assert kept == [] and scores == []
+
+
+class _Reranker:
+    """A cross-encoder whose answers are dictated per query."""
+
+    def __init__(self, by_query):
+        self.by_query = by_query
+        self.asked = []
+
+    async def rank(self, query, passages):
+        self.asked.append(query)
+        scores = self.by_query.get(query, {})
+        return sorted(
+            ((p, scores.get(p, 0.0)) for p in passages), key=lambda pair: pair[1], reverse=True
+        )
+
+
+def _edges(*facts):
+    return [SimpleNamespace(fact=fact) for fact in facts]
+
+
+@pytest.mark.asyncio
+async def test_a_recognised_answer_is_not_displaced_by_vague_resemblance():
+    """The two scales differ, which is why the passes are ordered and not mixed.
+
+    Measured: blending let 0.244 of transcript resemblance outrank 0.146 of an
+    exact answer, putting "Vit owns a computer called monter" above "monter has
+    two Samsung 990 disks" for the question "what disks do I have in it".
+    """
+    answer, vague = 'monter имеет два диска Samsung 990', 'Вит владеет компьютером monter'
+    reranker = _Reranker(
+        {
+            'что там за диски': {answer: 0.146, vague: 0.038},
+            'длинный контекст': {answer: 0.09, vague: 0.489},
+        }
+    )
+
+    edges, scores = await graphiti_mcp_server._rank_candidates(
+        reranker,
+        _edges(answer, vague),
+        'что там за диски',
+        'длинный контекст',
+        context_min_score=0.3,
+        min_score=0.08,
+        max_facts=6,
+    )
+
+    assert [e.fact for e in edges] == [answer]
+    assert reranker.asked == ['что там за диски']
+
+
+@pytest.mark.asyncio
+async def test_the_conversation_answers_what_the_remark_cannot():
+    """ "далеко это от меня вообще?" carries no word to rank by; the context knows."""
+    poti = 'Вит живёт рядом с городом Поти'
+    reranker = _Reranker(
+        {
+            'далеко это': {poti: 0.035},
+            'длинный контекст': {poti: 0.437},
+        }
+    )
+
+    edges, _ = await graphiti_mcp_server._rank_candidates(
+        reranker,
+        _edges(poti),
+        'далеко это',
+        'длинный контекст',
+        context_min_score=0.3,
+        min_score=0.08,
+        max_facts=6,
+    )
+
+    assert [e.fact for e in edges] == [poti]
+    assert reranker.asked == ['далеко это', 'длинный контекст']
+
+
+@pytest.mark.asyncio
+async def test_flat_on_both_passes_is_silence():
+    """A question the graph cannot answer: neither pass is certain, so nothing is said."""
+    junk = 'Эва отредактировала USER.md'
+    reranker = _Reranker(
+        {
+            'какая термопаста': {junk: 0.026},
+            'длинный контекст': {junk: 0.183},
+        }
+    )
+
+    edges, scores = await graphiti_mcp_server._rank_candidates(
+        reranker,
+        _edges(junk),
+        'какая термопаста',
+        'длинный контекст',
+        context_min_score=0.3,
+        min_score=0.08,
+        max_facts=6,
+    )
+
+    assert edges == [] and scores == []
+
+
+@pytest.mark.asyncio
+async def test_without_a_context_floor_the_remark_decides_alone():
+    """Unset means one pass, and no second bill."""
+    fact = 'Вит живёт рядом с городом Поти'
+    reranker = _Reranker({'далеко это': {fact: 0.035}, 'длинный контекст': {fact: 0.9}})
+
+    edges, _ = await graphiti_mcp_server._rank_candidates(
+        reranker,
+        _edges(fact),
+        'далеко это',
+        'длинный контекст',
+        context_min_score=None,
+        min_score=0.08,
+        max_facts=6,
+    )
+
+    assert edges == []
+    assert reranker.asked == ['далеко это']

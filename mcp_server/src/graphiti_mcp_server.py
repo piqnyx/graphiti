@@ -569,50 +569,62 @@ async def search_nodes(
         return ErrorResponse(error=f'Error searching nodes: {error_msg}')
 
 
+def _keep_above(candidates: list, scores: dict, floor: float | None, max_facts: int):
+    """The candidates a pass admitted, best first."""
+    kept = []
+    for edge in candidates:
+        score = scores.get(edge.fact)
+        if score is None or (floor is not None and score < floor):
+            continue
+        kept.append((edge, score))
+    kept.sort(key=lambda pair: pair[1], reverse=True)
+    kept = kept[:max_facts]
+    return [edge for edge, _ in kept], [score for _, score in kept]
+
+
 async def _rank_candidates(
     cross_encoder,
     candidates: list,
     focus: str,
     context: str,
-    context_weight: float,
+    context_min_score: float | None,
     min_score: float | None,
     max_facts: int,
 ) -> tuple[list, list[float]]:
-    """Score candidates by the remark, and by the conversation when asked.
+    """Score by the remark; fall back to the conversation only when it said nothing.
 
-    Two passes rather than one because the remark and the conversation fail in
-    opposite directions. Measured on a live graph: asked "что там у меня за диски
-    стоят?", scoring by the remark put the right fact first at 0.146 with the next
-    candidate at 0.046, while scoring by the surrounding transcript buried it under
-    facts the transcript merely mentioned. Asked "далеко это от меня вообще?" --
-    a remark with no word to rank by -- scoring by the remark spread every fact
-    across a single hundredth, while the conversation knew that "это" was Poti.
+    The remark and the conversation fail in opposite directions, and combining
+    their scores does not work: they are not on the same scale. Measured on a live
+    graph -- a specific question scores its one right answer around 0.15 and
+    everything else below 0.05, while the surrounding transcript resembles
+    everything a little and scores half the graph between 0.1 and 0.45. Taking the
+    better of the two, even with the transcript discounted by half, let 0.244 of
+    vague resemblance outrank 0.146 of an exact answer, and put "Vit owns a
+    computer called monter" above "monter has two Samsung 990 disks" for the
+    question "what disks do I have in it". The same blend also broke silence: for
+    a question the graph cannot answer at all, discounted transcript scores
+    reached 0.20 and would have cleared any floor the real answers needed.
 
-    The two are combined by taking the better of them, with the conversation
-    discounted, rather than by averaging. Averaging lets a fact the remark
-    genuinely matches be pulled down by talk it has nothing to do with; the
-    discount says the conversation may rescue a candidate the remark cannot judge,
-    but never outranks one the remark actually recognised.
+    So the passes are ordered rather than mixed. If the remark recognised nothing
+    above its floor, and only then, the conversation is asked -- with a floor of
+    its own, because its scale is different. Both floors matter: for "how far is
+    that from me" the remark is flat at 0.036 while the conversation is certain at
+    0.437, and for a question with no answer anywhere both are flat, which is how
+    the two cases are told apart.
+
+    Ordering it this way also means the second pass is usually not paid for.
     """
     if not candidates:
         return [], []
 
     passages = [edge.fact for edge in candidates]
     by_focus = dict(await cross_encoder.rank(focus, passages))
-    by_context = dict(await cross_encoder.rank(context, passages)) if context_weight > 0 else {}
+    edges, scores = _keep_above(candidates, by_focus, min_score, max_facts)
+    if edges or context_min_score is None or context == focus:
+        return edges, scores
 
-    scored = []
-    for edge in candidates:
-        score = by_focus.get(edge.fact, float('-inf'))
-        if context_weight > 0:
-            score = max(score, by_context.get(edge.fact, float('-inf')) * context_weight)
-        if min_score is not None and score < min_score:
-            continue
-        scored.append((edge, score))
-
-    scored.sort(key=lambda pair: pair[1], reverse=True)
-    kept = scored[:max_facts]
-    return [edge for edge, _ in kept], [score for _, score in kept]
+    by_context = dict(await cross_encoder.rank(context, passages))
+    return _keep_above(candidates, by_context, context_min_score, max_facts)
 
 
 @mcp.tool()
@@ -630,7 +642,7 @@ async def search_memory_facts(
     rerank: bool = False,
     min_score: float | None = None,
     focus: str | None = None,
-    context_weight: float = 0.0,
+    context_min_score: float | None = None,
 ) -> FactSearchResponse | ErrorResponse:
     """Search the graph memory for relevant facts (entity edges).
 
@@ -666,14 +678,16 @@ async def search_memory_facts(
             it around 0.5 and could not separate them, while the same reranker given
             the closing question alone scored everything below 0.07 -- correctly,
             since the graph held no answer to it. Ignored without rerank.
-        context_weight: How much a candidate's score against `query` counts when it
-            beats its score against `focus`. Zero means the remark decides alone,
-            which is right until the remark says nothing on its own: "далеко это от
-            меня вообще?" carries no word to rank by, and scoring by it alone put
-            every fact within a hundredth of every other. The context knows what
-            "это" was. Discounted rather than averaged, so a fact the remark
-            actually matches cannot be displaced by one the surrounding talk merely
-            mentions. Costs a second ranking pass.
+        context_min_score: The floor for a second pass scored against `query`,
+            taken only when the first pass admitted nothing. The remark decides
+            alone while it can, which is right until it says nothing on its own:
+            "далеко это от меня вообще?" carries no word to rank by, and scoring by
+            it alone put every fact within a hundredth of every other, while the
+            conversation knew that "это" was Poti and scored it 0.437. It needs a
+            floor of its own because the two scales differ -- a transcript
+            resembles everything a little, so its numbers run several times higher
+            than a specific question's. Unset means the remark decides or nothing
+            does. The second pass is only paid for when the first found nothing.
     """
     global graphiti_service
 
@@ -790,7 +804,13 @@ async def search_memory_facts(
             )
             candidates = results.edges
             relevant_edges, scores = await _rank_candidates(
-                client.cross_encoder, candidates, focus, query, context_weight, min_score, max_facts
+                client.cross_encoder,
+                candidates,
+                focus,
+                query,
+                context_min_score,
+                min_score,
+                max_facts,
             )
         else:
             results = await client.search_(
