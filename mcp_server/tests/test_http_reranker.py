@@ -63,7 +63,9 @@ async def test_raw_scores_are_not_normalised():
 @pytest.mark.asyncio
 async def test_an_index_the_server_invented_is_dropped():
     """Trusting it would score somebody else's passage, or crash on the boundary."""
-    payload = {'results': [{'index': 7, 'relevance_score': 1.0}, {'index': 0, 'relevance_score': 2.0}]}
+    payload = {
+        'results': [{'index': 7, 'relevance_score': 1.0}, {'index': 0, 'relevance_score': 2.0}]
+    }
     client = HTTPRerankerClient(url='http://x/v1/rerank', model='m', client=_server(payload))
 
     ranked = await client.rank('вопрос', ['первый', 'второй'])
@@ -83,8 +85,12 @@ async def test_nothing_to_rank_asks_nothing():
 @pytest.mark.asyncio
 async def test_the_query_and_every_passage_are_sent():
     seen: list[httpx.Request] = []
-    payload = {'results': [{'index': 0, 'relevance_score': 1.0}, {'index': 1, 'relevance_score': 0.5}]}
-    client = HTTPRerankerClient(url='http://x/v1/rerank', model='bge', client=_server(payload, seen))
+    payload = {
+        'results': [{'index': 0, 'relevance_score': 1.0}, {'index': 1, 'relevance_score': 0.5}]
+    }
+    client = HTTPRerankerClient(
+        url='http://x/v1/rerank', model='bge', client=_server(payload, seen)
+    )
 
     await client.rank('где живёт Вит', ['a', 'b'])
 
