@@ -47,6 +47,26 @@ The last four rows have never failed. They are listed because each one silently
 breaks chronology rather than announcing itself, and chronology is what the whole
 store is for.
 
+## 1a. Episode bodies · code
+
+The body is what extraction reads. Anything that leaked into it was read as if the
+user had said it, and nothing downstream can tell the difference.
+
+| check | healthy |
+|---|---|
+| body parses as JSON with `participants` and `messages` | always |
+| speaker names in `participants` | match the configured actors for that agent |
+| `<thinking>`, `<toolCall>` or any tool markup in the body | none |
+| `<graphiti-context>`, `<openviking-context>`, `<relevant-memories>` in the body | none — injected memory being recaptured as conversation |
+| the gateway's internal-context block | none |
+| empty message text | none |
+| `source_description` | the expected one for every episode |
+| the same message text twice in one body | none — see the rewind signature in section 8 |
+
+The injected-memory row is the one that compounds: memory recaptured as conversation
+becomes a fact about itself, and the next recall injects that. Nothing about the
+resulting fact looks synthetic.
+
 ## 2. Provenance and referential integrity · code
 
 Nothing here has been violated yet. All of it would be invisible until a query
@@ -130,6 +150,20 @@ most facts, so a hub is expected and its degree is a scale signal, not a defect.
 second component is different: it means a set of facts that no path connects to the
 rest, which is what happens when an entity is created under a variant name and never
 merged. Neither has been measured yet.
+
+### Summaries
+
+Entities and sagas both carry a summary that no query validates.
+
+| check | healthy | decided by |
+|---|---|---|
+| entities with an empty summary | report the share | code |
+| saga with no summary, or `last_summarized_at` older than its last episode | report | code |
+| a summary asserting something its own facts no longer support | none | model |
+
+A summary is written once and then drifts: the facts under it get invalidated and it
+keeps saying what it said. It is also what a person reads first, so it drifts in the
+most visible place.
 
 ## 5. Facts · code, with one model pass
 
