@@ -281,6 +281,8 @@ improvement switched off.
 | facts filtered as superseded | non-zero once anything has been invalidated | works |
 | facts filtered by the floor | non-zero once a floor is set | 0 — the floors were unset |
 | recall latency | report median and worst | median 952 ms, worst 7.3 s |
+| turns where a quote was attached | report the share | 1 of 1 on the first turn after it shipped |
+| characters spent on quotes, against characters spent on facts | report the ratio | 705 of 1112 |
 | score distribution against the floor | report, once scores are logged | not yet logged |
 
 Two effects to name explicitly, because each looks like the other in a summary:
@@ -294,6 +296,45 @@ Two effects to name explicitly, because each looks like the other in a summary:
 A false negative is worth more attention than a false positive here, and it needs a
 question whose answer is known to be in the graph. Measured: the floor returned zero
 facts for a direct question about the user's home while the answer was present.
+
+## 7a. What actually lands in her context · code, from the plugin log
+
+The block is the only part of this system the model ever sees. Everything else is
+machinery that produces it, so a defect here is worth more than a defect anywhere
+above, and it is also the easiest place to stop looking — the log renders it as one
+escaped line, which reads as fine because it reads as nothing.
+
+**Print it, decoded, before judging it.** Every measurement in this section was
+found by unescaping one line and looking, and none of them were visible in the log.
+
+| check | healthy | decided by |
+|---|---|---|
+| exactly one opening and one closing wrapper tag | always | code |
+| markup from a fact or a quote appearing unescaped | none — a fact could otherwise close the block early | code |
+| injected characters against the configured ceiling | never above | code |
+| facts quoted against `recallExpandTop` | never above | code |
+| the same passage quoted more than once | none | code |
+| a quoted line without a speaker | none | code |
+| whitespace-only lines inside a quote | none | code |
+| `from episode` naming an episode that exists | always | code |
+| facts arriving without an episode id | report the share — the source lookup failed | code |
+| a quote carrying the memory wrapper of an earlier turn | none — recall being recaptured and fed back | code |
+| the language of the block | as configured | code |
+| whether the quote actually explains the fact it hangs under | eyes, then model |
+
+The recapture row is the one that compounds and the one nothing else catches. If an
+injected block reaches capture, the memory becomes an episode, the episode becomes a
+fact about the memory, and the next recall injects that. Section 1a checks the
+episode side of the same loop; this checks the side that starts it.
+
+**Measured 2026-08-21, on the first live turn after the format changed.** A question
+naming two people returned a single fact, quoted correctly and usefully, while the
+graph held at least five facts about those two. The block was well-formed and the
+quote was the right passage — the defect was upstream, in the floor, and only the
+decoded block made it obvious that one fact was all she got.
+
+That is the shape of the finding this section exists for: the block is where a
+retrieval problem becomes visible as a reading problem.
 
 ## 8. Capture health · code, from the plugin log
 
