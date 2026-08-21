@@ -46,3 +46,33 @@ def test_extra_updates_ride_along_for_the_cross_encoder_recipe():
     assert widened.reranker_min_score == 0.08
     assert widened.edge_config.sim_min_score == 0.3
     assert widened.limit == 40
+
+
+class _Edge:
+    def __init__(self, uuid, fact):
+        self.uuid = uuid
+        self.fact = fact
+
+
+def test_merging_keeps_the_first_appearance_and_drops_repeats():
+    from graphiti_mcp_server import merge_candidates
+
+    remark = [_Edge('a', 'про Марину'), _Edge('b', 'про Антона')]
+    conversation = [_Edge('b', 'про Антона'), _Edge('c', 'про C++')]
+    merged = merge_candidates(remark, conversation)
+    assert [edge.uuid for edge in merged] == ['a', 'b', 'c']
+
+
+def test_two_edges_sharing_a_sentence_stay_two():
+    from graphiti_mcp_server import merge_candidates
+
+    # Identity is the uuid, not the text: this graph holds duplicated facts, and
+    # collapsing them here would hide a defect rather than fix it.
+    merged = merge_candidates([_Edge('a', 'одно и то же'), _Edge('b', 'одно и то же')])
+    assert len(merged) == 2
+
+
+def test_merging_nothing_is_nothing():
+    from graphiti_mcp_server import merge_candidates
+
+    assert merge_candidates([], []) == []
