@@ -569,7 +569,7 @@ async def search_nodes(
         return ErrorResponse(error=f'Error searching nodes: {error_msg}')
 
 
-def discriminates(scores: list[float], min_spread: float | None, least: int = 4) -> bool:
+def discriminates(scores: list[float | None], min_spread: float | None, least: int = 4) -> bool:
     """Whether a ranking said anything, or merely returned numbers.
 
     A reranker asked something it cannot answer does not say so; it scores every
@@ -583,25 +583,48 @@ def discriminates(scores: list[float], min_spread: float | None, least: int = 4)
     order of magnitude. Below `least` results there is not enough of a spread to
     read, and the test stands aside rather than guessing.
     """
-    if min_spread is None or len(scores) < least:
+    # Only the ranked ones. An unranked candidate carries no score, and counting it
+    # as a zero would stretch the spread of any ranking to nearly the whole of its
+    # top -- turning the flat rankings this exists to refuse into passing ones.
+    ranked = [score for score in scores if score is not None]
+    if min_spread is None or len(ranked) < least:
         return True
-    top = scores[0]
+    top = ranked[0]
     if top <= 0:
         return False
-    return (top - scores[-1]) / top >= min_spread
+    return (top - ranked[-1]) / top >= min_spread
 
 
 def _keep_above(candidates: list, scores: dict, floor: float | None, max_facts: int):
-    """The candidates a pass admitted, best first."""
+    """The candidates a pass admitted, best first, with the unranked ones after them.
+
+    A ranker is asked for every passage and may return fewer. Treating "it did not
+    score this" as "it scored below the floor" was silent in the response and visible
+    only as a warning in the server's own log, so a ranker that quietly capped its
+    reply looked exactly like a strict floor.
+
+    Such a candidate cannot be placed among the others -- there is nothing to place it
+    by -- so it goes after all of them and carries no score. The caller can then see
+    that it was retrieved and not judged, rather than infer it from a count that does
+    not add up.
+    """
     kept = []
+    unranked = []
     for edge in candidates:
         score = scores.get(edge.fact)
-        if score is None or (floor is not None and score < floor):
+        if score is None:
+            unranked.append(edge)
+            continue
+        if floor is not None and score < floor:
             continue
         kept.append((edge, score))
     kept.sort(key=lambda pair: pair[1], reverse=True)
-    kept = kept[:max_facts]
-    return [edge for edge, _ in kept], [score for _, score in kept]
+
+    edges = [edge for edge, _ in kept]
+    values: list[float | None] = [score for _, score in kept]
+    edges.extend(unranked)
+    values.extend([None] * len(unranked))
+    return edges[:max_facts], values[:max_facts]
 
 
 def merge_candidates(*groups) -> list:
@@ -849,8 +872,13 @@ async def search_memory_facts(
         # limit equal to the answer size would rerank exactly the eight that the
         # weaker ordering already chose, which is no reranking at all.
         candidate_limit = pool if pool and pool > 0 else max_facts
+        # Only alongside a reranker. Without one the recipe ranks by reciprocal rank
+        # fusion, where a score is 1/(position+1) -- so a number chosen as "relevance
+        # of at least 0.08" silently becomes "no deeper than twelfth", and 0.3 becomes
+        # "the first three, whatever the question". The two scales share a config key
+        # and nothing warns; the RRF one is not a quantity anybody can set on purpose.
         extra_update: dict[str, object] = {}
-        if min_score is not None:
+        if min_score is not None and rerank:
             extra_update['reranker_min_score'] = min_score
         config_copy = widen_recipe(recipe, candidate_limit, vector_min_score, extra_update)
 
@@ -935,7 +963,7 @@ async def search_memory_facts(
         facts = []
         for position, edge in enumerate(relevant_edges):
             fact = format_fact_result(edge)
-            if position < len(scores):
+            if position < len(scores) and scores[position] is not None:
                 fact['score'] = scores[position]
             facts.append(fact)
         return FactSearchResponse(
