@@ -129,3 +129,42 @@ def test_a_pinned_language_still_leaves_relation_types_in_english(monkeypatch):
     assert 'SCREAMING_SNAKE_CASE' in instruction
     # Both branches, or the impossible case is unaddressed again.
     assert 'LIKES' in instruction and 'KHACHAPURI' in instruction
+
+
+class _StatusError(Exception):
+    """An SDK exception carrying a status the way openai's APIStatusError does."""
+
+    def __init__(self, status_code: int):
+        super().__init__(f'status {status_code}')
+        self.status_code = status_code
+
+
+def test_a_provider_500_is_retryable_however_the_sdk_raised_it():
+    from graphiti_core.llm_client.client import is_server_or_retry_error
+
+    # openai.InternalServerError is not an httpx exception, so it went unrecognised:
+    # the call failed, the episode failed with it, and the whole extraction was
+    # replayed from the beginning to reach the one stage that had broken.
+    assert is_server_or_retry_error(_StatusError(500))
+    assert is_server_or_retry_error(_StatusError(503))
+
+
+def test_a_client_error_is_not_retried():
+    from graphiti_core.llm_client.client import is_server_or_retry_error
+
+    # Retrying these changes nothing and costs a full extraction each time.
+    assert not is_server_or_retry_error(_StatusError(400))
+    assert not is_server_or_retry_error(_StatusError(404))
+    assert not is_server_or_retry_error(ValueError('unrelated'))
+
+
+def test_an_httpx_500_is_still_retryable():
+    import httpx
+
+    from graphiti_core.llm_client.client import is_server_or_retry_error
+
+    request = httpx.Request('POST', 'http://example.invalid')
+    error = httpx.HTTPStatusError(
+        'boom', request=request, response=httpx.Response(502, request=request)
+    )
+    assert is_server_or_retry_error(error)
