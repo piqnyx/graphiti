@@ -31,11 +31,15 @@ class Edge(BaseModel):
     )
     relation_type: str = Field(
         ...,
-        description='The type of relationship between the entities, in SCREAMING_SNAKE_CASE (e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH)',
+        description='The kind of relationship between the entities, in SCREAMING_SNAKE_CASE '
+        '(e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH). Three words at most, naming the kind and '
+        'not the particular instance: everything specific to this one belongs in the fact.',
     )
     fact: str = Field(
         ...,
-        description='A natural language description of the relationship between the entities, paraphrased from the source text',
+        description='A natural language description of the relationship between the entities, '
+        'paraphrased from the source text. Entities from the ENTITIES list are named in it exactly '
+        'as that list spells them.',
     )
     valid_at: str | None = Field(
         None,
@@ -157,13 +161,17 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
 5. The `fact` MUST preserve all specific details from the source text: proper nouns, brand names, product names, model numbers, quantities, counts, colors, materials, physical descriptions, specific items, named locations, and named activities. Paraphrase the sentence structure but NEVER generalize:
    - NEVER generalize "Gamecube" to "gaming console", "Ford Mustang" to "car", "wool coat" to "coat", "red and purple lighting" to "lighting", "cracked windshield" to "car damage", or "three screenplays" to "several screenplays".
    - Do not verbatim quote the original text, but every concrete noun, number, and descriptor in the source should survive into the `fact`.
-6. Use `REFERENCE_TIME` to resolve vague or relative temporal expressions (e.g., "last week"). When the CURRENT_MESSAGE contains multiple episodes with per-episode timestamps, prefer the timestamp of the specific episode the fact originates from.
-7. Do **not** hallucinate or infer temporal bounds from unrelated events.
+6. When the `fact` mentions an entity that appears in the ENTITIES list, spell that entity's name exactly as the list spells it: same script, same letters, same wording. The speaker's own spelling of it does not carry over into the `fact`.
+   - The `fact` text is what search reads. A name written one way in the graph and another way in the fact cannot be found by the name the graph knows it under, so the fact becomes unreachable by its own subject.
+7. Use `REFERENCE_TIME` to resolve vague or relative temporal expressions (e.g., "last week"). When the CURRENT_MESSAGE contains multiple episodes with per-episode timestamps, prefer the timestamp of the specific episode the fact originates from.
+8. Do **not** hallucinate or infer temporal bounds from unrelated events.
 
 # RELATION TYPE RULES
 
 - If FACT_TYPES are provided and the relationship matches one of the types (considering the entity type signature), use that fact_type_name as the `relation_type`.
 - Otherwise, derive a `relation_type` from the relationship predicate in SCREAMING_SNAKE_CASE (e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH).
+- The `relation_type` names the **kind** of relationship, never the particular one. Keep it to three words at most, and put everything specific about this instance — what, where, how much, which one — in the `fact` and nowhere else.
+  - Two statements of the same relationship must arrive under the same `relation_type`, or nothing downstream can tell they are about the same thing. A type that retells its own fact is unique by construction, so it is never recognised twice, and the pair it belongs to accumulates rival copies that no comparison will ever resolve.
 
 # DATETIME RULES
 
