@@ -32,8 +32,8 @@ class Edge(BaseModel):
     relation_type: str = Field(
         ...,
         description='The kind of relationship between the entities, in SCREAMING_SNAKE_CASE '
-        '(e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH). Three words at most, naming the kind and '
-        'not the particular instance: everything specific to this one belongs in the fact.',
+        '(e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH). As few words as the kind needs, naming the '
+        'kind and not the particular instance: everything specific to this one belongs in the fact.',
     )
     fact: str = Field(
         ...,
@@ -170,7 +170,7 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
 
 - If FACT_TYPES are provided and the relationship matches one of the types (considering the entity type signature), use that fact_type_name as the `relation_type`.
 - Otherwise, derive a `relation_type` from the relationship predicate in SCREAMING_SNAKE_CASE (e.g., WORKS_AT, LIVES_IN, IS_FRIENDS_WITH).
-- The `relation_type` names the **kind** of relationship, never the particular one. Keep it to three words at most, and put everything specific about this instance — what, where, how much, which one — in the `fact` and nowhere else.
+- The `relation_type` names the **kind** of relationship, never the particular one. Use as few words as the kind itself needs — usually one or two — and put everything specific about this instance — what, where, how much, which one — in the `fact` and nowhere else.
   - Two statements of the same relationship must arrive under the same `relation_type`, or nothing downstream can tell they are about the same thing. A type that retells its own fact is unique by construction, so it is never recognised twice, and the pair it belongs to accumulates rival copies that no comparison will ever resolve.
 
 # DATETIME RULES

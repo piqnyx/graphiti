@@ -26,7 +26,11 @@ from .snippets import summary_instructions
 
 
 class ExtractedEntity(BaseModel):
-    name: str = Field(..., description='Name of the extracted entity')
+    name: str = Field(
+        ...,
+        description='Name of the extracted entity, in its base dictionary form: nominative, singular, '
+        'however the sentence inflected it.',
+    )
     entity_type_id: int = Field(
         description='ID of the classified entity type. '
         'Must be one of the provided entity_type_id integers.',
@@ -254,6 +258,7 @@ Guidelines:
 4. Be explicit in naming entities — use full names when available.
 5. Use the most specific form present in the data (e.g., "road cycling" not "cycling").
 6. If a value would not be meaningful and distinguishable when read alone later, do NOT extract it.
+7. Give each entity's name in its base dictionary form -- nominative, singular -- whatever form the sentence put it in. A language that inflects its nouns otherwise enters the same thing under a different name every time it appears in a different role, and nothing downstream can tell those apart.
 
 {context['custom_extraction_instructions']}
 
@@ -322,7 +327,8 @@ Guidelines:
 6. When the text refers to a person's relative, pet, or associate by a bare term, qualify the
    entity with the possessor's name (e.g., "Dr. Osei's colleague" not "colleague").
 7. If a phrase would not be meaningful and distinguishable when read alone later, do NOT extract it.
-8. When in doubt, do NOT extract.
+8. Give each entity's name in its base dictionary form -- nominative, singular -- whatever form the sentence put it in. A language that inflects its nouns otherwise enters the same thing under a different name every time it appears in a different role, and nothing downstream can tell those apart.
+9. When in doubt, do NOT extract.
 
 {context['custom_extraction_instructions']}
 
