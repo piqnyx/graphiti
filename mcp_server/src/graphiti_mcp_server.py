@@ -582,6 +582,24 @@ def _keep_above(candidates: list, scores: dict, floor: float | None, max_facts: 
     return [edge for edge, _ in kept], [score for _, score in kept]
 
 
+def widen_recipe(source, limit: int, vector_min_score: float | None, extra: dict | None = None):
+    """Apply the pool, and the floor deciding what leaves the database at all.
+
+    `limit` asks the vector search for that many edges; `sim_min_score` decides which
+    of them are allowed out, and the library sets it to 0.6 -- a cosine that two
+    paraphrases of one sentence routinely miss. Measured on a live graph: a pool of 40
+    yielded two candidates, so the cross-encoder ranked two, and every floor above it
+    was re-deciding what this one had already decided.
+
+    Left alone unless the caller asks for it. Raising the pool without lowering this
+    changes nothing, and lowering it without a reranker turns recall into noise.
+    """
+    copy = source.model_copy(deep=True, update={'limit': limit, **(extra or {})})
+    if vector_min_score is not None and getattr(copy, 'edge_config', None) is not None:
+        copy.edge_config.sim_min_score = vector_min_score
+    return copy
+
+
 async def _rank_candidates(
     cross_encoder,
     candidates: list,
@@ -641,6 +659,7 @@ async def search_memory_facts(
     pool: int | None = None,
     rerank: bool = False,
     min_score: float | None = None,
+    vector_min_score: float | None = None,
     focus: str | None = None,
     context_min_score: float | None = None,
 ) -> FactSearchResponse | ErrorResponse:
@@ -666,6 +685,11 @@ async def search_memory_facts(
         rerank: Score the candidates with the configured cross-encoder against this
             query rather than fusing the search methods by rank. Needs a
             cross-encoder configured -- see GRAPHITI_RERANKER_URL.
+        vector_min_score: Optional cosine floor on what the vector search returns at
+            all, before anything ranks it. The library's own default is 0.6, which two
+            paraphrases of one sentence routinely miss -- measured here, a pool of 40
+            came back with two. Lower it to let the cross-encoder judge a wide pool;
+            leave it alone when nothing is reranking.
         min_score: Drop candidates scoring below this. The scale belongs to
             whichever reranker ran: rank fusion yields small positive numbers, a bge
             cross-encoder yields logits either side of zero. An empty result is a
@@ -770,10 +794,10 @@ async def search_memory_facts(
         # limit equal to the answer size would rerank exactly the eight that the
         # weaker ordering already chose, which is no reranking at all.
         candidate_limit = pool if pool and pool > 0 else max_facts
-        update: dict[str, object] = {'limit': candidate_limit}
+        extra_update: dict[str, object] = {}
         if min_score is not None:
-            update['reranker_min_score'] = min_score
-        config_copy = recipe.model_copy(deep=True, update=update)
+            extra_update['reranker_min_score'] = min_score
+        config_copy = widen_recipe(recipe, candidate_limit, vector_min_score, extra_update)
 
         # Retrieval and ranking are asked different questions when `focus` is given:
         # the vector comes from the context, the text handed to the reranker is the
@@ -790,9 +814,7 @@ async def search_memory_facts(
             # conversation -- and the search ranks once by construction. And the
             # cross-encoder recipe hands the ranker `[:limit]` of the pool, so
             # scoring the whole pool means holding it.
-            retrieval = EDGE_HYBRID_SEARCH_RRF.model_copy(
-                deep=True, update={'limit': candidate_limit}
-            )
+            retrieval = widen_recipe(EDGE_HYBRID_SEARCH_RRF, candidate_limit, vector_min_score)
             results = await client.search_(
                 query=rank_text,
                 config=retrieval,
