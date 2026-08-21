@@ -105,3 +105,39 @@ def test_the_test_stands_aside_unless_asked():
     from graphiti_mcp_server import discriminates
 
     assert discriminates([0.80, 0.79, 0.79, 0.79], None)
+
+
+def test_an_unranked_candidate_goes_last_without_a_score():
+    from graphiti_mcp_server import _keep_above
+
+    class E:
+        def __init__(self, fact):
+            self.fact = fact
+
+    a, b, c = E('a'), E('b'), E('c')
+    edges, scores = _keep_above([a, b, c], {'a': 0.5, 'c': 0.1}, None, 8)
+    # b was never scored: it cannot be placed among the others, so it goes after them
+    # and says so with a score of None rather than being dropped in silence.
+    assert edges == [a, c, b]
+    assert scores == [0.5, 0.1, None]
+
+
+def test_a_floor_cuts_the_low_but_not_the_unranked():
+    from graphiti_mcp_server import _keep_above
+
+    class E:
+        def __init__(self, fact):
+            self.fact = fact
+
+    a, b, c = E('a'), E('b'), E('c')
+    edges, scores = _keep_above([a, b, c], {'a': 0.5, 'c': 0.01}, 0.08, 8)
+    assert edges == [a, b]
+    assert scores == [0.5, None]
+
+
+def test_an_unranked_candidate_cannot_rescue_a_flat_ranking():
+    from graphiti_mcp_server import discriminates
+
+    # Counted as a zero it would stretch the spread to nearly the whole of the top,
+    # and the flat rankings this refuses would start passing.
+    assert not discriminates([0.8088, 0.8041, 0.8009, 0.8003, 0.7998, None], 0.2)
