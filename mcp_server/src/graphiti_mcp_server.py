@@ -582,6 +582,26 @@ def _keep_above(candidates: list, scores: dict, floor: float | None, max_facts: 
     return [edge for edge, _ in kept], [score for _, score in kept]
 
 
+def merge_candidates(*groups) -> list:
+    """One candidate list from several searches, without repeats.
+
+    Order is kept as given and the first appearance wins, so the caller decides
+    which search speaks first. Identity is the edge uuid: the same fact retrieved
+    twice is one candidate, and two different edges that happen to share a sentence
+    stay two.
+    """
+    merged = []
+    seen = set()
+    for group in groups:
+        for edge in group:
+            uuid = getattr(edge, 'uuid', None)
+            if uuid in seen:
+                continue
+            seen.add(uuid)
+            merged.append(edge)
+    return merged
+
+
 def widen_recipe(source, limit: int, vector_min_score: float | None, extra: dict | None = None):
     """Apply the pool, and the floor deciding what leaves the database at all.
 
@@ -815,16 +835,35 @@ async def search_memory_facts(
             # cross-encoder recipe hands the ranker `[:limit]` of the pool, so
             # scoring the whole pool means holding it.
             retrieval = widen_recipe(EDGE_HYBRID_SEARCH_RRF, candidate_limit, vector_min_score)
-            results = await client.search_(
-                query=rank_text,
-                config=retrieval,
-                group_ids=effective_group_ids,
-                center_node_uuid=center_node_uuid,
-                search_filter=search_filter,
-                driver=scoped_driver,
-                query_vector=query_vector,
-            )
-            candidates = results.edges
+
+            async def fetch(text: str, vector):
+                found = await client.search_(
+                    query=text,
+                    config=retrieval,
+                    group_ids=effective_group_ids,
+                    center_node_uuid=center_node_uuid,
+                    search_filter=search_filter,
+                    driver=scoped_driver,
+                    query_vector=vector,
+                )
+                return found.edges
+
+            # Two searches, because one cannot hear both. The conversation's vector
+            # finds what the exchange has been about; the remark's finds what was just
+            # asked. Measured on a live graph: asked about two people after a long
+            # answer on another subject, the conversation's vector returned eight
+            # candidates and not one of them was about those people, while the graph
+            # held several -- and no amount of reranking rescues a candidate that was
+            # never fetched. The remark cannot help through the text half either: this
+            # fork's fulltext branch is dead on FalkorDB, so the vector is the whole of
+            # retrieval.
+            #
+            # The remark speaks first in the merge, so when the two disagree the
+            # question just asked outranks the subject being left behind.
+            candidates = await fetch(query, query_vector)
+            if focus != query:
+                focus_vector = await client.embedder.create(input_data=[focus])
+                candidates = merge_candidates(await fetch(focus, focus_vector), candidates)
             relevant_edges, scores = await _rank_candidates(
                 client.cross_encoder,
                 candidates,
