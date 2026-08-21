@@ -76,3 +76,32 @@ def test_merging_nothing_is_nothing():
     from graphiti_mcp_server import merge_candidates
 
     assert merge_candidates([], []) == []
+
+
+def test_a_ranking_that_separates_is_kept():
+    from graphiti_mcp_server import discriminates
+
+    # Asked which car someone drives: the answer second, the tail far below.
+    assert discriminates([0.6178, 0.6083, 0.513, 0.379, 0.2752, 0.1354], 0.2)
+
+
+def test_a_flat_ranking_is_refused():
+    from graphiti_mcp_server import discriminates
+
+    # Asked how far away something was, and asked about a fridge nobody mentioned.
+    assert not discriminates([0.8088, 0.8041, 0.8009, 0.8003, 0.7998, 0.7922], 0.2)
+    assert not discriminates([0.6192, 0.6122, 0.6108, 0.6061, 0.603, 0.5818], 0.2)
+
+
+def test_too_few_results_to_read_a_spread():
+    from graphiti_mcp_server import discriminates
+
+    # Two facts sitting close may both be right; there is no distribution to judge.
+    assert discriminates([0.28, 0.27], 0.2)
+    assert discriminates([], 0.2)
+
+
+def test_the_test_stands_aside_unless_asked():
+    from graphiti_mcp_server import discriminates
+
+    assert discriminates([0.80, 0.79, 0.79, 0.79], None)

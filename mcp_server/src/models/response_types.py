@@ -32,6 +32,11 @@ class NodeSearchResponse(TypedDict):
 class FactSearchResponse(TypedDict):
     message: str
     facts: list[dict[str, Any]]
+    # Which pass produced the scores. Without it the caller reads a column of
+    # numbers with no way to know whether they are on the remark's scale or the
+    # conversation's -- and the two are not comparable, so a floor tuned on one
+    # silently means something else on the other.
+    ranked_by: NotRequired[str]
 
 
 class EpisodeSearchResponse(TypedDict):
