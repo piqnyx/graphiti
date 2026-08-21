@@ -569,6 +569,28 @@ async def search_nodes(
         return ErrorResponse(error=f'Error searching nodes: {error_msg}')
 
 
+def discriminates(scores: list[float], min_spread: float | None, least: int = 4) -> bool:
+    """Whether a ranking said anything, or merely returned numbers.
+
+    A reranker asked something it cannot answer does not say so; it scores every
+    candidate about the same. Measured on a live graph: asked which car someone
+    drives, the scores ran 0.62 down to 0.14 and the answer was second; asked how
+    far away something was, and asked the brand of a fridge nobody had mentioned,
+    they ran 0.809-0.792 and 0.619-0.582 -- confident-looking, uniformly, about
+    corn and vans.
+
+    So the signal is the spread, not the height, and the two cases differ by an
+    order of magnitude. Below `least` results there is not enough of a spread to
+    read, and the test stands aside rather than guessing.
+    """
+    if min_spread is None or len(scores) < least:
+        return True
+    top = scores[0]
+    if top <= 0:
+        return False
+    return (top - scores[-1]) / top >= min_spread
+
+
 def _keep_above(candidates: list, scores: dict, floor: float | None, max_facts: int):
     """The candidates a pass admitted, best first."""
     kept = []
@@ -628,7 +650,8 @@ async def _rank_candidates(
     context_min_score: float | None,
     min_score: float | None,
     max_facts: int,
-) -> tuple[list, list[float]]:
+    min_spread: float | None = None,
+) -> tuple[list, list[float], str]:
     """Score by the remark; fall back to the conversation only when it said nothing.
 
     The remark and the conversation fail in opposite directions, and combining
@@ -653,16 +676,21 @@ async def _rank_candidates(
     Ordering it this way also means the second pass is usually not paid for.
     """
     if not candidates:
-        return [], []
+        return [], [], 'nothing'
 
     passages = [edge.fact for edge in candidates]
     by_focus = dict(await cross_encoder.rank(focus, passages))
     edges, scores = _keep_above(candidates, by_focus, min_score, max_facts)
+    if not discriminates(scores, min_spread):
+        edges, scores = [], []
     if edges or context_min_score is None or context == focus:
-        return edges, scores
+        return edges, scores, 'remark'
 
     by_context = dict(await cross_encoder.rank(context, passages))
-    return _keep_above(candidates, by_context, context_min_score, max_facts)
+    edges, scores = _keep_above(candidates, by_context, context_min_score, max_facts)
+    if not discriminates(scores, min_spread):
+        edges, scores = [], []
+    return edges, scores, 'conversation'
 
 
 @mcp.tool()
@@ -679,6 +707,7 @@ async def search_memory_facts(
     pool: int | None = None,
     rerank: bool = False,
     min_score: float | None = None,
+    min_spread: float | None = None,
     vector_min_score: float | None = None,
     focus: str | None = None,
     context_min_score: float | None = None,
@@ -710,6 +739,12 @@ async def search_memory_facts(
             paraphrases of one sentence routinely miss -- measured here, a pool of 40
             came back with two. Lower it to let the cross-encoder judge a wide pool;
             leave it alone when nothing is reranking.
+        min_spread: Optional floor on how much the top and bottom of a ranking differ,
+            as a fraction of the top. A reranker asked something it cannot answer does
+            not say so -- it scores everything about the same, high. Measured here:
+            0.62 down to 0.14 when it knew the answer, 0.809 down to 0.792 when it did
+            not. Below four results the spread cannot be read and the test stands
+            aside.
         min_score: Drop candidates scoring below this. The scale belongs to
             whichever reranker ran: rank fusion yields small positive numbers, a bge
             cross-encoder yields logits either side of zero. An empty result is a
@@ -864,7 +899,7 @@ async def search_memory_facts(
             if focus != query:
                 focus_vector = await client.embedder.create(input_data=[focus])
                 candidates = merge_candidates(await fetch(focus, focus_vector), candidates)
-            relevant_edges, scores = await _rank_candidates(
+            relevant_edges, scores, ranked_by = await _rank_candidates(
                 client.cross_encoder,
                 candidates,
                 focus,
@@ -872,6 +907,7 @@ async def search_memory_facts(
                 context_min_score,
                 min_score,
                 max_facts,
+                min_spread,
             )
         else:
             results = await client.search_(
@@ -883,6 +919,7 @@ async def search_memory_facts(
                 driver=scoped_driver,
                 query_vector=query_vector,
             )
+            ranked_by = 'fusion'
             relevant_edges = results.edges[:max_facts]
             # Scores are parallel to edges before the slice, and are what makes an
             # empty answer readable: "nothing scored above the floor" and "the
@@ -891,7 +928,9 @@ async def search_memory_facts(
             scores = results.edge_reranker_scores[:max_facts]
 
         if not relevant_edges:
-            return FactSearchResponse(message='No relevant facts found', facts=[])
+            return FactSearchResponse(
+                message='No relevant facts found', facts=[], ranked_by=ranked_by
+            )
 
         facts = []
         for position, edge in enumerate(relevant_edges):
@@ -899,7 +938,9 @@ async def search_memory_facts(
             if position < len(scores):
                 fact['score'] = scores[position]
             facts.append(fact)
-        return FactSearchResponse(message='Facts retrieved successfully', facts=facts)
+        return FactSearchResponse(
+            message='Facts retrieved successfully', facts=facts, ranked_by=ranked_by
+        )
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')
