@@ -51,8 +51,44 @@ def _reasoning_kwargs() -> dict[str, Any]:
     can be enabled separately to verify what was actually sent and what the gateway
     returned instead of inferring provider behaviour from token totals.
     """
-    effort = os.environ.get('GRAPHITI_REASONING_EFFORT', '').strip()
+    effort = _reasoning_effort()
     return {'reasoning_effort': effort} if effort else {}
+
+
+def _reasoning_effort() -> str:
+    """The reasoning effort for the call in flight, per stage when asked.
+
+    Mirrors ``_thinking_mode`` -- same ``prefix=value`` pairs, same fallback, same
+    source for the stage name -- and exists for the same reason: reasoning is not
+    uniformly good, and the stage that needs it is not the stage it wrecks.
+
+    Two switches rather than one because gateways hear different ones. Measured
+    2026-08-22 against Google through an OpenAI-compatible gateway:
+    ``reasoning_effort`` is honoured there alongside a ``response_format``
+    (``medium`` spent 736 tokens on a prompt that costs 20 without it), while the
+    ``thinking`` object is rejected outright with ``Unknown name "thinking"``.
+    opencode.ai is the mirror image: it ignores ``reasoning_effort`` at every value
+    and only answers to the object. A deployment sets whichever its gateway hears;
+    the unset one sends nothing, which is the behaviour before either existed.
+
+    On Google ``minimal`` is how a stage says "do not think" -- ``off`` is not a
+    valid level and a zero thinking budget is rejected.
+    """
+    default = os.environ.get('GRAPHITI_REASONING_EFFORT', '').strip()
+    overrides = os.environ.get('GRAPHITI_REASONING_EFFORT_BY_PROMPT', '').strip()
+    if not overrides:
+        return default
+
+    prompt_name = str((_TRACE_CONTEXT.get() or {}).get('prompt_name') or '')
+    if not prompt_name:
+        return default
+
+    for pair in overrides.split(','):
+        prefix, sep, effort = pair.partition('=')
+        prefix = prefix.strip()
+        if sep and prefix and prompt_name.startswith(prefix):
+            return effort.strip()
+    return default
 
 
 def _thinking_kwargs() -> dict[str, Any]:
