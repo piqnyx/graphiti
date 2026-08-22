@@ -100,9 +100,21 @@ def is_server_or_retry_error(exception):
     if isinstance(exception, RateLimitError | EmptyResponseError | json.decoder.JSONDecodeError | ValidationError):
         return True
 
-    return (
-        isinstance(exception, httpx.HTTPStatusError) and 500 <= exception.response.status_code < 600
-    )
+    if isinstance(exception, httpx.HTTPStatusError) and 500 <= exception.response.status_code < 600:
+        return True
+
+    # The same failure arrives under a different class depending on who raised it. A
+    # provider 500 through the OpenAI SDK is openai.InternalServerError, which is not
+    # an httpx exception and so was not retried at all -- the call failed, the episode
+    # failed with it, and the durable queue replayed the whole thing: entities and
+    # deduplication redone from scratch to reach the one stage that had broken.
+    # Measured: three full extractions of one batch, roughly eight minutes of work
+    # each, for a single 500 that a bounded retry would have absorbed.
+    #
+    # Read the status rather than the class, so a client this file does not import is
+    # covered too.
+    status = getattr(exception, 'status_code', None)
+    return isinstance(status, int) and 500 <= status < 600
 
 
 class LLMClient(ABC):
