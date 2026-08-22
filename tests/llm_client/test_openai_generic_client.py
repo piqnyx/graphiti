@@ -10,6 +10,7 @@ from graphiti_core.llm_client.errors import EmptyResponseError, OutputLimitError
 from graphiti_core.llm_client.openai_generic_client import (
     _TRACE_CONTEXT,
     OpenAIGenericClient,
+    _reasoning_kwargs,
     _thinking_kwargs,
 )
 from graphiti_core.prompts.models import Message
@@ -356,5 +357,68 @@ def test_an_unset_switch_still_sends_nothing(monkeypatch):
     token = _with_prompt('dedupe_nodes.nodes')
     try:
         assert _thinking_kwargs() == {}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_reasoning_effort_without_overrides_is_the_global_one(monkeypatch):
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT', 'medium')
+    monkeypatch.delenv('GRAPHITI_REASONING_EFFORT_BY_PROMPT', raising=False)
+    token = _with_prompt('dedupe_nodes.nodes')
+    try:
+        assert _reasoning_kwargs() == {'reasoning_effort': 'medium'}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_a_matching_stage_override_wins_over_the_global_effort(monkeypatch):
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT', 'medium')
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT_BY_PROMPT', 'dedupe_nodes=minimal')
+    token = _with_prompt('dedupe_nodes.nodes')
+    try:
+        assert _reasoning_kwargs() == {'reasoning_effort': 'minimal'}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_a_stage_the_effort_overrides_do_not_name_keeps_the_global_one(monkeypatch):
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT', 'medium')
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT_BY_PROMPT', 'dedupe_nodes=minimal')
+    token = _with_prompt('dedupe_edges.resolve_edge')
+    try:
+        assert _reasoning_kwargs() == {'reasoning_effort': 'medium'}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_effort_overrides_are_ignored_when_the_stage_is_unknown(monkeypatch):
+    """No prompt name means no way to tell the stages apart, so the global effort stands."""
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT', 'medium')
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT_BY_PROMPT', 'dedupe_nodes=minimal')
+    token = _TRACE_CONTEXT.set(None)
+    try:
+        assert _reasoning_kwargs() == {'reasoning_effort': 'medium'}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_an_unset_effort_still_sends_nothing(monkeypatch):
+    """The behaviour before any of this existed, and the one gateways expect."""
+    monkeypatch.delenv('GRAPHITI_REASONING_EFFORT', raising=False)
+    monkeypatch.delenv('GRAPHITI_REASONING_EFFORT_BY_PROMPT', raising=False)
+    token = _with_prompt('dedupe_nodes.nodes')
+    try:
+        assert _reasoning_kwargs() == {}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_a_stage_override_cannot_revive_an_unset_effort(monkeypatch):
+    """An override names a value for a stage, not a reason to start sending one."""
+    monkeypatch.delenv('GRAPHITI_REASONING_EFFORT', raising=False)
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT_BY_PROMPT', 'dedupe_edges=high')
+    token = _with_prompt('dedupe_nodes.nodes')
+    try:
+        assert _reasoning_kwargs() == {}
     finally:
         _TRACE_CONTEXT.reset(token)
