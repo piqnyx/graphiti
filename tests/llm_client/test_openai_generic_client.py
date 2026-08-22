@@ -413,12 +413,34 @@ def test_an_unset_effort_still_sends_nothing(monkeypatch):
         _TRACE_CONTEXT.reset(token)
 
 
-def test_a_stage_override_cannot_revive_an_unset_effort(monkeypatch):
-    """An override names a value for a stage, not a reason to start sending one."""
+def test_an_unmatched_stage_override_leaves_the_effort_unset(monkeypatch):
+    """A stage the overrides do not name falls back to the global value, empty or not."""
     monkeypatch.delenv('GRAPHITI_REASONING_EFFORT', raising=False)
     monkeypatch.setenv('GRAPHITI_REASONING_EFFORT_BY_PROMPT', 'dedupe_edges=high')
     token = _with_prompt('dedupe_nodes.nodes')
     try:
         assert _reasoning_kwargs() == {}
+    finally:
+        _TRACE_CONTEXT.reset(token)
+
+
+def test_a_matching_stage_override_sends_even_with_the_global_unset(monkeypatch):
+    """A named stage speaks for itself, and that is a trap worth stating.
+
+    Clearing the global switch does not silence a stage the overrides still name:
+    the override is a value for that stage, not a modifier of a value that must
+    already exist. Measured 2026-08-22 on the thinking switch, which behaves the
+    same way -- clearing GRAPHITI_THINKING while leaving
+    GRAPHITI_THINKING_BY_PROMPT=dedupe_nodes=disabled kept sending the thinking
+    object on exactly that one stage, and the gateway rejected every dedupe_nodes
+    call with `Unknown name "thinking"` while every other stage went through.
+
+    Moving between gateways therefore means clearing both variables, not one.
+    """
+    monkeypatch.delenv('GRAPHITI_REASONING_EFFORT', raising=False)
+    monkeypatch.setenv('GRAPHITI_REASONING_EFFORT_BY_PROMPT', 'dedupe_nodes=minimal')
+    token = _with_prompt('dedupe_nodes.nodes')
+    try:
+        assert _reasoning_kwargs() == {'reasoning_effort': 'minimal'}
     finally:
         _TRACE_CONTEXT.reset(token)
