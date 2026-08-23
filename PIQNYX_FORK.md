@@ -96,11 +96,11 @@ Queue status exposes per-group pending/running state for diagnostics.
 
 ### Edge extraction output budget
 
-`graphiti_core/utils/maintenance/edge_operations.py` is the only extraction path in core that pins its own `max_tokens` instead of using the configured one. Upstream pins 16384.
+`graphiti_core/utils/maintenance/edge_operations.py` is the only extraction path in core that pins its own `max_tokens` instead of using the configured one. Upstream pins 16384. The fork passes nothing, so `generate_response` falls back to the configured budget and the deployment governs this call the way it governs every other.
 
-The target deployment runs a reasoning backend, where `max_tokens` covers reasoning tokens as well as the answer: a probe of the deployed model returned an empty body with `finish_reason=length` once the budget was consumed before any JSON was emitted. An empty body raises `EmptyResponseError`, which is retried four times and then fails the episode, blocking that group's queue.
+The pin mattered because the target deployment runs a reasoning backend, where `max_tokens` covers reasoning tokens as well as the answer: a probe returned an empty body with `finish_reason=length` once the budget was consumed before any JSON was emitted, and an empty body raises `EmptyResponseError`, which is retried four times and then fails the episode, blocking that group's queue. A later batch stopped at exactly 65536 output tokens — a truncated reply rather than a long one, whose JSON never closes.
 
-The fork therefore raises this single constant to 65536 so the edge call has the same headroom as the configured budget for every other call. No other behavior changes; the value is a cap, not an allocation.
+The fork answered both by raising the constant, first to 65536 and then to 131072. The second raise changed nothing: `OpenAIGenericClient` clamps an explicit request to the deployment ceiling — `min(requested, self.max_tokens)`, covered by `test_explicit_prompt_budget_cannot_exceed_deployment_ceiling` — so a pin above that ceiling asks for nothing extra and only misdescribes the call. Passing no budget at all leaves one knob that means what it says: set the deployment's budget and this call follows it.
 
 ### Fork-only read-only tools
 

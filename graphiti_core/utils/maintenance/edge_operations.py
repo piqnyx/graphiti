@@ -138,17 +138,16 @@ async def extract_edges(
 
     start = time()
 
-    # The only extraction call in core that pins its own output budget instead of
-    # using the configured one. A reasoning backend spends part of that budget on
-    # reasoning tokens before emitting any JSON, so on larger episodes 16K can be
-    # exhausted before the answer starts and the call returns an empty body.
+    # Upstream pins its own output budget here, and this is the only extraction
+    # call in core that does. Nothing is pinned now: passing no max_tokens lets
+    # generate_response fall back to the configured one, so the deployment's
+    # budget governs this call like it governs every other.
     #
-    # Raised to 128K after a live batch stopped at exactly 65536 output tokens:
-    # that is a truncated reply, not a long one — the JSON never closes, parsing
-    # fails, and the episode never appears while the caller sees only "queued".
-    # Note that the figure being pinned here at all is why raising llm.max_tokens
-    # in configuration had no effect on fact extraction.
-    extract_edges_max_tokens = 131072
+    # The pin was raised twice chasing truncation -- 16K, then 64K, then 128K --
+    # because a reasoning backend spends part of the budget on reasoning tokens
+    # before any JSON is emitted. The last raise could not have helped: the client
+    # clamps an explicit request to the deployment ceiling, so a figure above it
+    # asks for nothing extra and only misreports what this call does.
     llm_client = clients.llm_client
 
     # Build mapping from edge type name to list of valid signatures
@@ -212,7 +211,6 @@ async def extract_edges(
     llm_response = await llm_client.generate_response(
         prompt_library.extract_edges.edge(context),
         response_model=ExtractedEdges,
-        max_tokens=extract_edges_max_tokens,
         group_id=group_id or primary_episode.group_id,
         prompt_name='extract_edges.edge',
     )
