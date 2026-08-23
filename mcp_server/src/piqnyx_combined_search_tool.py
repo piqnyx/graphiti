@@ -67,6 +67,12 @@ MAX_POOL = 200
 # floor scored 0.177, so the margin is wide in both directions.
 DEFAULT_MIN_SCORE = 0.11
 
+# What the vector search is allowed to return at all, before anything ranks it.
+# The library sets this to 0.6 and a pool of 40 then came back with two — measured
+# on a live graph, and the reason recall lowers it. Ranking two candidates out of
+# a pool of forty is not ranking, it is agreeing with retrieval.
+DEFAULT_VECTOR_MIN_SCORE = 0.25
+
 # A reranker is given a pair, not a document. A whole episode is thousands of
 # characters and one such pair has already returned HTTP 500 from the local
 # server, so passages are cut to something a cross-encoder is built to judge.
@@ -85,6 +91,7 @@ def install_search_memory_combined_tool(server: Any) -> None:
         valid_at_before: str | None = None,
         created_at_after: str | None = None,
         min_score: float | None = None,
+        vector_min_score: float | None = None,
         pool: int | None = None,
         rerank: bool = True,
     ) -> dict[str, Any] | ErrorResponse:
@@ -109,6 +116,9 @@ def install_search_memory_combined_tool(server: Any) -> None:
                 subject was discussed, as opposed to when it was true.
             min_score: Floor on the relevance score. Defaults to the measured one;
                 lower it for a deliberately broad sweep.
+            vector_min_score: Floor on what the vector search returns at all, before
+                ranking. Raising it starves the pool; the relevance floor above is
+                the one to move.
             pool: How many candidates to rank before choosing `limit` of them.
             rerank: Rank by relevance. Off returns retrieval order with fusion
                 scores, which are positions rather than relevance.
@@ -156,6 +166,18 @@ def install_search_memory_combined_tool(server: Any) -> None:
             config = COMBINED_HYBRID_SEARCH_RRF.model_copy(
                 deep=True, update={'limit': candidate_limit}
             )
+            # Two floors, and only one of them is a judgement. This one decides
+            # what leaves the database, and its job is to keep the pool full so the
+            # ranker has something to choose among; the relevance floor decides what
+            # is worth saying. Leaving this at the library's 0.6 makes the pool tiny
+            # and the ranking cosmetic.
+            floor_out = (
+                DEFAULT_VECTOR_MIN_SCORE if vector_min_score is None else float(vector_min_score)
+            )
+            for section in ('edge_config', 'node_config'):
+                block = getattr(config, section, None)
+                if block is not None and hasattr(block, 'sim_min_score'):
+                    block.sim_min_score = floor_out
             results = await client.search_(
                 query=query,
                 config=config,
@@ -243,6 +265,7 @@ def install_search_memory_combined_tool(server: Any) -> None:
             # below its own noise.
             'ranked_by': ranked_by,
             'min_score': floor if ranked_by == 'relevance' else None,
+            'vector_min_score': floor_out,
             'facts': [
                 {
                     'uuid': edge.uuid,

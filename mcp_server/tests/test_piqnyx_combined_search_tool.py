@@ -358,3 +358,32 @@ async def test_an_entity_is_judged_by_its_summary_not_by_its_name_alone():
     assert out['entities'][0]['score'] == 0.6
     # Provenance still travels: an entity carries the episodes that mention it.
     assert out['entities'][0]['episodes'] == ['ep-3']
+
+
+@pytest.mark.asyncio
+async def test_the_pool_is_not_starved_by_the_library_floor():
+    # Two floors, and only one is a judgement. This one decides what leaves the
+    # database; the library sets it to 0.6 and a pool of forty then came back with
+    # two, which is what made recall lower it. Ranking two out of forty is not
+    # ranking, it is agreeing with retrieval.
+    client = FakeClient(results(), cross_encoder=FakeCrossEncoder({}))
+    server = build_server(client)
+    patch.install_search_memory_combined_tool(server)
+
+    out = await server.mcp.tools['search_memory_combined']('q', group_id='main')
+
+    config = client.calls[0]['config']
+    assert config.edge_config.sim_min_score == patch.DEFAULT_VECTOR_MIN_SCORE
+    assert config.node_config.sim_min_score == patch.DEFAULT_VECTOR_MIN_SCORE
+    assert out['vector_min_score'] == patch.DEFAULT_VECTOR_MIN_SCORE
+
+
+@pytest.mark.asyncio
+async def test_the_caller_can_set_what_leaves_the_database():
+    client = FakeClient(results(), cross_encoder=FakeCrossEncoder({}))
+    server = build_server(client)
+    patch.install_search_memory_combined_tool(server)
+
+    await server.mcp.tools['search_memory_combined']('q', group_id='main', vector_min_score=0.8)
+
+    assert client.calls[0]['config'].edge_config.sim_min_score == 0.8
