@@ -30,7 +30,7 @@ from ..tracer import NoOpTracer, Tracer
 from .cache import LLMCache
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
 from .errors import EmptyResponseError, RateLimitError, RefusalError
-from .respacing import respace_json_blobs
+from .respacing import respaced_messages
 from .token_tracker import TokenUsageTracker
 
 DEFAULT_TEMPERATURE = 0
@@ -91,14 +91,6 @@ def get_extraction_language_instruction(group_id: str | None = None) -> str:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _respaced(messages: list[Message]) -> list[Message] | None:
-    """The same messages with any embedded JSON set out differently, or None if none was."""
-    spaced = [m.model_copy(update={'content': respace_json_blobs(m.content)}) for m in messages]
-    if all(new.content == old.content for new, old in zip(spaced, messages, strict=True)):
-        return None
-    return spaced
 
 
 def is_server_or_retry_error(exception):
@@ -310,10 +302,10 @@ class LLMClient(ABC):
                         messages, response_model, max_tokens, model_size
                     )
                 except RefusalError:
-                    # One retry, and only when the bytes actually differ: `_respaced`
+                    # One retry, and only when the bytes actually differ: the helper
                     # returns None when there was no JSON to set out differently, and
                     # resending an identical prompt earns an identical refusal.
-                    respaced = _respaced(messages)
+                    respaced = respaced_messages(messages)
                     if respaced is None:
                         raise
                     logger.warning(

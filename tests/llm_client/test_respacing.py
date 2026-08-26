@@ -2,7 +2,7 @@
 
 import json
 
-from graphiti_core.llm_client.respacing import respace_json_blobs
+from graphiti_core.llm_client.respacing import respace_json_blobs, respaced_messages
 
 
 def test_spaces_the_separators_of_an_embedded_object():
@@ -37,3 +37,26 @@ def test_keeps_non_ascii_unescaped():
     # ensure_ascii would triple the byte count of Cyrillic and change what the
     # provider is asked to read.
     assert 'Вит' in respace_json_blobs('{"user":"Вит"}')
+
+
+class _Msg:
+    """Stands in for prompts.models.Message: only model_copy and content are used."""
+
+    def __init__(self, content: str):
+        self.content = content
+
+    def model_copy(self, update):
+        return _Msg(update['content'])
+
+
+def test_respaced_messages_returns_none_when_nothing_changes():
+    assert respaced_messages([_Msg('no json here'), _Msg('nor here')]) is None
+
+
+def test_respaced_messages_rewrites_only_the_layout():
+    original = '{"messages":[{"role":"user","text":"привет"}]}'
+    spaced = respaced_messages([_Msg('prompt'), _Msg(original)])
+    assert spaced is not None
+    assert spaced[0].content == 'prompt'
+    assert spaced[1].content != original
+    assert json.loads(spaced[1].content) == json.loads(original)
