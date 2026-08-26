@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from ..prompts.models import Message
 from .client import LLMClient, get_extraction_language_instruction
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
-from .errors import EmptyResponseError, OutputLimitError, RateLimitError
+from .errors import EmptyResponseError, OutputLimitError, RateLimitError, RefusalError
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +361,13 @@ class OpenAIGenericClient(LLMClient):
         try:
             response = await self.client.chat.completions.create(**request_kwargs)
             choice = response.choices[0]
-            result = choice.message.content or ''
+            # A refused prompt comes back as a choice carrying nothing but a
+            # finish_reason: no message at all, not merely an empty one. Reaching
+            # through `.message` turned that into an AttributeError, which read as a
+            # transient fault and was retried forever -- one refused batch held the
+            # head of its queue for ten hours and thirty-nine attempts.
+            message = getattr(choice, 'message', None)
+            result = (getattr(message, 'content', None) or '') if message is not None else ''
             finish_reason = getattr(choice, 'finish_reason', None)
             usage = getattr(response, 'usage', None)
             completion_tokens = _completion_tokens(usage)
@@ -377,6 +383,12 @@ class OpenAIGenericClient(LLMClient):
                     'content': result,
                 }
             )
+
+            # OpenAI says `content_filter` flat; Google's OpenAI-compatible layer says
+            # `content_filter: PROHIBITED_CONTENT`. Match the substring so a provider
+            # that decorates the value further is still understood.
+            if 'content_filter' in str(finish_reason or '').lower():
+                raise RefusalError(f'provider refused the prompt (finish_reason={finish_reason!r})')
 
             # Explicit length is definitive. Some OpenAI-compatible gateways have also
             # been observed to report stop/empty content while billing exactly the entire
