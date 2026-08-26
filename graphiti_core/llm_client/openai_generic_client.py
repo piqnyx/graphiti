@@ -34,6 +34,7 @@ from ..prompts.models import Message
 from .client import LLMClient, get_extraction_language_instruction
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
 from .errors import EmptyResponseError, OutputLimitError, RateLimitError, RefusalError
+from .respacing import respaced_messages
 
 logger = logging.getLogger(__name__)
 
@@ -518,9 +519,23 @@ class OpenAIGenericClient(LLMClient):
                 # Delegate to the base tenacity wrapper so genuinely transient JSON /
                 # rate-limit failures get bounded backoff retries. OutputLimitError is
                 # intentionally not retryable here: the outer durable queue owns that wait.
-                return await self._generate_response_with_retry(
-                    messages, response_model, max_tokens=max_tokens, model_size=model_size
-                )
+                try:
+                    return await self._generate_response_with_retry(
+                        messages, response_model, max_tokens=max_tokens, model_size=model_size
+                    )
+                except RefusalError:
+                    # This client does not go through LLMClient.generate_response, so
+                    # the retry that lives there never runs for it. It has to be here
+                    # too, on the path that is actually taken.
+                    respaced = respaced_messages(messages)
+                    if respaced is None:
+                        raise
+                    logger.warning(
+                        'prompt refused; retrying once with the same text set differently'
+                    )
+                    return await self._generate_response_with_retry(
+                        respaced, response_model, max_tokens=max_tokens, model_size=model_size
+                    )
             except Exception as e:
                 span.set_status('error', str(e))
                 span.record_exception(e)

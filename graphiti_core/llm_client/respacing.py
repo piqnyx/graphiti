@@ -2,6 +2,8 @@
 
 import json
 
+from ..prompts.models import Message
+
 
 def respace_json_blobs(text: str) -> str:
     """Re-serialise every JSON object embedded in `text`, spacing its separators.
@@ -41,3 +43,16 @@ def respace_json_blobs(text: str) -> str:
         out.append(text[i:start])
         out.append(json.dumps(value, ensure_ascii=False, separators=(', ', ': ')))
         i = end
+
+
+def respaced_messages(messages: list[Message]) -> list[Message] | None:
+    """The same messages with any embedded JSON set out differently, or None if none was.
+
+    None means the transform changed nothing, so a second attempt would send
+    byte-identical bytes and earn a byte-identical refusal. Not making that call is
+    the point.
+    """
+    spaced = [m.model_copy(update={'content': respace_json_blobs(m.content)}) for m in messages]
+    if all(new.content == old.content for new, old in zip(spaced, messages, strict=True)):
+        return None
+    return spaced
