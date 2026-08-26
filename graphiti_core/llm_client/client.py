@@ -29,8 +29,7 @@ from ..prompts.models import Message
 from ..tracer import NoOpTracer, Tracer
 from .cache import LLMCache
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
-from .errors import EmptyResponseError, RateLimitError, RefusalError
-from .respacing import respaced_messages
+from .errors import EmptyResponseError, RateLimitError
 from .token_tracker import TokenUsageTracker
 
 DEFAULT_TEMPERATURE = 0
@@ -296,24 +295,17 @@ class LLMClient(ABC):
             span.add_attributes({'cache.hit': False})
 
             # Execute LLM call
+            #
+            # The refusal retry does not live here. Every client that can meet a refusal
+            # overrides this method -- anthropic, gemini, openai_base and the generic
+            # client all have their own -- and only GroqClient, which never raises one,
+            # reaches this line. A handler here would read as the central one and never
+            # run, which is exactly the mistake that cost a deploy: see the retry in
+            # OpenAIGenericClient.generate_response, on the path actually taken.
             try:
-                try:
-                    response = await self._generate_response_with_retry(
-                        messages, response_model, max_tokens, model_size
-                    )
-                except RefusalError:
-                    # One retry, and only when the bytes actually differ: the helper
-                    # returns None when there was no JSON to set out differently, and
-                    # resending an identical prompt earns an identical refusal.
-                    respaced = respaced_messages(messages)
-                    if respaced is None:
-                        raise
-                    logger.warning(
-                        'prompt refused; retrying once with the same text set differently'
-                    )
-                    response = await self._generate_response_with_retry(
-                        respaced, response_model, max_tokens, model_size
-                    )
+                response = await self._generate_response_with_retry(
+                    messages, response_model, max_tokens, model_size
+                )
             except Exception as e:
                 span.set_status('error', str(e))
                 span.record_exception(e)
