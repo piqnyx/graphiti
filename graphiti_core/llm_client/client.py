@@ -29,7 +29,8 @@ from ..prompts.models import Message
 from ..tracer import NoOpTracer, Tracer
 from .cache import LLMCache
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
-from .errors import EmptyResponseError, RateLimitError
+from .errors import EmptyResponseError, RateLimitError, RefusalError
+from .respacing import respace_json_blobs
 from .token_tracker import TokenUsageTracker
 
 DEFAULT_TEMPERATURE = 0
@@ -90,6 +91,14 @@ def get_extraction_language_instruction(group_id: str | None = None) -> str:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _respaced(messages: list[Message]) -> list[Message] | None:
+    """The same messages with any embedded JSON set out differently, or None if none was."""
+    spaced = [m.model_copy(update={'content': respace_json_blobs(m.content)}) for m in messages]
+    if all(new.content == old.content for new, old in zip(spaced, messages, strict=True)):
+        return None
+    return spaced
 
 
 def is_server_or_retry_error(exception):
@@ -296,9 +305,23 @@ class LLMClient(ABC):
 
             # Execute LLM call
             try:
-                response = await self._generate_response_with_retry(
-                    messages, response_model, max_tokens, model_size
-                )
+                try:
+                    response = await self._generate_response_with_retry(
+                        messages, response_model, max_tokens, model_size
+                    )
+                except RefusalError:
+                    # One retry, and only when the bytes actually differ: `_respaced`
+                    # returns None when there was no JSON to set out differently, and
+                    # resending an identical prompt earns an identical refusal.
+                    respaced = _respaced(messages)
+                    if respaced is None:
+                        raise
+                    logger.warning(
+                        'prompt refused; retrying once with the same text set differently'
+                    )
+                    response = await self._generate_response_with_retry(
+                        respaced, response_model, max_tokens, model_size
+                    )
             except Exception as e:
                 span.set_status('error', str(e))
                 span.record_exception(e)
