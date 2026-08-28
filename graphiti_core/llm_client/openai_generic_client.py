@@ -361,7 +361,17 @@ class OpenAIGenericClient(LLMClient):
 
         try:
             response = await self.client.chat.completions.create(**request_kwargs)
-            choice = response.choices[0]
+            # A block at the prompt level returns no choices at all -- google
+            # answers one with `promptFeedback` and an empty list -- and indexing
+            # into that raised IndexError one line above the guard written for the
+            # very same refusal. The guard was put one level too deep.
+            choices = getattr(response, 'choices', None) or []
+            if not choices:
+                raise RefusalError(
+                    f'provider returned no choices at all '
+                    f'(prompt_feedback={getattr(response, "prompt_feedback", None)!r})'
+                )
+            choice = choices[0]
             # A refused prompt comes back as a choice carrying nothing but a
             # finish_reason: no message at all, not merely an empty one. Reaching
             # through `.message` turned that into an AttributeError, which read as a
