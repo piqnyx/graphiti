@@ -34,7 +34,6 @@ from ..prompts.models import Message
 from .client import LLMClient, get_extraction_language_instruction
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
 from .errors import EmptyResponseError, OutputLimitError, RateLimitError, RefusalError
-from .respacing import respaced_messages
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +398,14 @@ class OpenAIGenericClient(LLMClient):
             # `content_filter: PROHIBITED_CONTENT`. Match the substring so a provider
             # that decorates the value further is still understood.
             if 'content_filter' in str(finish_reason or '').lower():
+                # Said out loud, not only raised. Nothing retries this any more, so the
+                # container's log is where anyone looks to find out why a batch stopped
+                # moving -- and an exception that travels up through a queue does not
+                # necessarily arrive there in a readable shape.
+                logger.warning(
+                    'prompt refused by the provider (finish_reason=%r, prompt=%s)',
+                    finish_reason, trace_context.get('prompt_name'),
+                )
                 raise RefusalError(f'provider refused the prompt (finish_reason={finish_reason!r})')
 
             # Explicit length is definitive. Some OpenAI-compatible gateways have also
@@ -407,6 +414,10 @@ class OpenAIGenericClient(LLMClient):
             # the body is absent or cannot be parsed below.
             budget_exhausted = completion_tokens is not None and completion_tokens >= max_tokens
             if finish_reason == 'length':
+                logger.warning(
+                    'answer cut off at the output limit (max_tokens=%s, prompt=%s)',
+                    max_tokens, trace_context.get('prompt_name'),
+                )
                 raise OutputLimitError(
                     f'LLM output limit reached (max_tokens={max_tokens}, completion_tokens={completion_tokens}, content_chars={len(result)})'
                 )
@@ -416,6 +427,10 @@ class OpenAIGenericClient(LLMClient):
                     raise OutputLimitError(
                         f'LLM completion budget exhausted before content (max_tokens={max_tokens}, completion_tokens={completion_tokens})'
                     )
+                logger.warning(
+                    'provider returned an empty answer (prompt=%s)',
+                    trace_context.get('prompt_name'),
+                )
                 raise EmptyResponseError('LLM returned an empty response')
 
             try:
@@ -529,23 +544,16 @@ class OpenAIGenericClient(LLMClient):
                 # Delegate to the base tenacity wrapper so genuinely transient JSON /
                 # rate-limit failures get bounded backoff retries. OutputLimitError is
                 # intentionally not retryable here: the outer durable queue owns that wait.
-                try:
-                    return await self._generate_response_with_retry(
-                        messages, response_model, max_tokens=max_tokens, model_size=model_size
-                    )
-                except RefusalError:
-                    # This client does not go through LLMClient.generate_response, so
-                    # the retry that lives there never runs for it. It has to be here
-                    # too, on the path that is actually taken.
-                    respaced = respaced_messages(messages)
-                    if respaced is None:
-                        raise
-                    logger.warning(
-                        'prompt refused; retrying once with the same text set differently'
-                    )
-                    return await self._generate_response_with_retry(
-                        respaced, response_model, max_tokens=max_tokens, model_size=model_size
-                    )
+                #
+                # A refusal is not retried at all. It used to go a second time with the
+                # same text spaced differently, which did get answers the compact form
+                # did not -- but it is a trick played on a filter, and it costs a second
+                # request out of a quota that is counted, on a prompt already known to be
+                # refused. A refusal now travels up as it is, named, for the queue to
+                # decide about.
+                return await self._generate_response_with_retry(
+                    messages, response_model, max_tokens=max_tokens, model_size=model_size
+                )
             except Exception as e:
                 span.set_status('error', str(e))
                 span.record_exception(e)
