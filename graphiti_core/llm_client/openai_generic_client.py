@@ -398,14 +398,6 @@ class OpenAIGenericClient(LLMClient):
             # `content_filter: PROHIBITED_CONTENT`. Match the substring so a provider
             # that decorates the value further is still understood.
             if 'content_filter' in str(finish_reason or '').lower():
-                # Said out loud, not only raised. Nothing retries this any more, so the
-                # container's log is where anyone looks to find out why a batch stopped
-                # moving -- and an exception that travels up through a queue does not
-                # necessarily arrive there in a readable shape.
-                logger.warning(
-                    'prompt refused by the provider (finish_reason=%r, prompt=%s)',
-                    finish_reason, trace_context.get('prompt_name'),
-                )
                 raise RefusalError(f'provider refused the prompt (finish_reason={finish_reason!r})')
 
             # Explicit length is definitive. Some OpenAI-compatible gateways have also
@@ -414,10 +406,6 @@ class OpenAIGenericClient(LLMClient):
             # the body is absent or cannot be parsed below.
             budget_exhausted = completion_tokens is not None and completion_tokens >= max_tokens
             if finish_reason == 'length':
-                logger.warning(
-                    'answer cut off at the output limit (max_tokens=%s, prompt=%s)',
-                    max_tokens, trace_context.get('prompt_name'),
-                )
                 raise OutputLimitError(
                     f'LLM output limit reached (max_tokens={max_tokens}, completion_tokens={completion_tokens}, content_chars={len(result)})'
                 )
@@ -427,10 +415,6 @@ class OpenAIGenericClient(LLMClient):
                     raise OutputLimitError(
                         f'LLM completion budget exhausted before content (max_tokens={max_tokens}, completion_tokens={completion_tokens})'
                     )
-                logger.warning(
-                    'provider returned an empty answer (prompt=%s)',
-                    trace_context.get('prompt_name'),
-                )
                 raise EmptyResponseError('LLM returned an empty response')
 
             try:
@@ -473,7 +457,16 @@ class OpenAIGenericClient(LLMClient):
                     'error': str(e),
                 }
             )
-            logger.error(f'Error in generating LLM response: {e}')
+            # The prompt name, because it is the one thing that says which batch
+            # stopped and it was not in here. Three warnings were added a commit
+            # ago to carry it, each immediately before a raise this line catches
+            # -- so every refusal wrote two lines saying the same thing, and the
+            # prompt-level block, which is Google's actual refusal shape, still
+            # wrote one line without a name.
+            logger.error(
+                'Error in generating LLM response (prompt=%s): %s',
+                (_TRACE_CONTEXT.get() or {}).get('prompt_name'), e,
+            )
             raise
 
     async def generate_response(

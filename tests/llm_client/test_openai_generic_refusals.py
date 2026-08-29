@@ -76,13 +76,13 @@ async def test_a_refusal_is_not_sent_a_second_time(caplog):
     # Ровно один обход провайдера. Второй был бы трюком против фильтра ценой
     # запроса из считаемой квоты, на промпте, про который уже известно.
     completions = Completions([choice(finish_reason='content_filter: PROHIBITED_CONTENT')])
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.ERROR):
         with pytest.raises(RefusalError):
             await ask(build(completions))
     assert len(completions.calls) == 1
-    # Именно наша строка, а не слово из текста самой ошибки: на общей проверке
-    # мутация «убрать запись в лог» проходила незамеченной.
-    assert 'prompt refused by the provider' in caplog.text
+    # Имя промпта в записи -- то единственное, что говорит, какой батч встал.
+    assert 'prompt=extract_nodes.extract_json' in caplog.text
+    assert 'refused the prompt' in caplog.text
 
 
 @pytest.mark.asyncio
@@ -100,28 +100,28 @@ async def test_an_answer_cut_off_at_the_limit_is_named(caplog):
     # Тоже один обход: обрыв на потолке вывода повтором не лечится, тем же
     # запросом получится тот же обрыв.
     completions = Completions([choice(content='{"foo":', finish_reason='length')])
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.ERROR):
         with pytest.raises(Exception) as caught:
             await ask(build(completions))
     assert type(caught.value).__name__ == 'OutputLimitError'
     assert len(completions.calls) == 1
-    assert 'cut off' in caplog.text
+    assert 'prompt=extract_nodes.extract_json' in caplog.text
+    assert 'output limit reached' in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_an_empty_answer_is_named(caplog):
+async def test_an_empty_answer_is_named():
     # Мимо обёртки с повторами, напрямую: она считает пустой ответ временным и
     # ходит до четырёх раз с растущей паузой, так что через неё этот тест стоил
     # бы минуты. Проверяется сам страж, а политика повторов -- отдельно ниже.
     completions = Completions([choice(content='')])
     client = build(completions)
-    with caplog.at_level(logging.WARNING):
-        with pytest.raises(EmptyResponseError):
-            await client._generate_response(
-                [Message(role='user', content='скажи что-нибудь')],
-                response_model=ResponseModel,
-            )
-    assert 'empty answer' in caplog.text
+    with pytest.raises(EmptyResponseError) as caught:
+        await client._generate_response(
+            [Message(role='user', content='скажи что-нибудь')],
+            response_model=ResponseModel,
+        )
+    assert 'empty response' in str(caught.value)
 
 
 def test_what_is_worth_a_second_request_and_what_is_not():
