@@ -34,7 +34,6 @@ from ..prompts.models import Message
 from .client import LLMClient, get_extraction_language_instruction
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
 from .errors import EmptyResponseError, OutputLimitError, RateLimitError, RefusalError
-from .respacing import respaced_messages
 
 logger = logging.getLogger(__name__)
 
@@ -378,7 +377,11 @@ class OpenAIGenericClient(LLMClient):
             # transient fault and was retried forever -- one refused batch held the
             # head of its queue for ten hours and thirty-nine attempts.
             message = getattr(choice, 'message', None)
-            result = (getattr(message, 'content', None) or '') if message is not None else ''
+            # `getattr` уже отвечает за оба случая: и когда `message` отсутствует,
+            # и когда он есть и равен None -- второе как раз и присылает SDK на
+            # отказ. Отдельная ветка под None была неразличима ни одним тестом,
+            # потому что различать там нечего.
+            result = getattr(message, 'content', None) or ''
             finish_reason = getattr(choice, 'finish_reason', None)
             usage = getattr(response, 'usage', None)
             completion_tokens = _completion_tokens(usage)
@@ -458,7 +461,16 @@ class OpenAIGenericClient(LLMClient):
                     'error': str(e),
                 }
             )
-            logger.error(f'Error in generating LLM response: {e}')
+            # The prompt name, because it is the one thing that says which batch
+            # stopped and it was not in here. Three warnings were added a commit
+            # ago to carry it, each immediately before a raise this line catches
+            # -- so every refusal wrote two lines saying the same thing, and the
+            # prompt-level block, which is Google's actual refusal shape, still
+            # wrote one line without a name.
+            logger.error(
+                'Error in generating LLM response (prompt=%s): %s',
+                (_TRACE_CONTEXT.get() or {}).get('prompt_name'), e,
+            )
             raise
 
     async def generate_response(
@@ -529,23 +541,16 @@ class OpenAIGenericClient(LLMClient):
                 # Delegate to the base tenacity wrapper so genuinely transient JSON /
                 # rate-limit failures get bounded backoff retries. OutputLimitError is
                 # intentionally not retryable here: the outer durable queue owns that wait.
-                try:
-                    return await self._generate_response_with_retry(
-                        messages, response_model, max_tokens=max_tokens, model_size=model_size
-                    )
-                except RefusalError:
-                    # This client does not go through LLMClient.generate_response, so
-                    # the retry that lives there never runs for it. It has to be here
-                    # too, on the path that is actually taken.
-                    respaced = respaced_messages(messages)
-                    if respaced is None:
-                        raise
-                    logger.warning(
-                        'prompt refused; retrying once with the same text set differently'
-                    )
-                    return await self._generate_response_with_retry(
-                        respaced, response_model, max_tokens=max_tokens, model_size=model_size
-                    )
+                #
+                # A refusal is not retried at all. It used to go a second time with the
+                # same text spaced differently, which did get answers the compact form
+                # did not -- but it is a trick played on a filter, and it costs a second
+                # request out of a quota that is counted, on a prompt already known to be
+                # refused. A refusal now travels up as it is, named, for the queue to
+                # decide about.
+                return await self._generate_response_with_retry(
+                    messages, response_model, max_tokens=max_tokens, model_size=model_size
+                )
             except Exception as e:
                 span.set_status('error', str(e))
                 span.record_exception(e)

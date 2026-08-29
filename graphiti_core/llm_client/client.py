@@ -296,12 +296,16 @@ class LLMClient(ABC):
 
             # Execute LLM call
             #
-            # The refusal retry does not live here. Every client that can meet a refusal
-            # overrides this method -- anthropic, gemini, openai_base and the generic
-            # client all have their own -- and only GroqClient, which never raises one,
-            # reaches this line. A handler here would read as the central one and never
-            # run, which is exactly the mistake that cost a deploy: see the retry in
-            # OpenAIGenericClient.generate_response, on the path actually taken.
+            # Nothing retries a refusal any more, here or anywhere. There used to be
+            # one in OpenAIGenericClient that sent the same prompt a second time with
+            # its json respaced, and it went with the rest of the work against the
+            # filter: it is a trick, and it costs a second request out of a quota that
+            # is counted, on a prompt already known to be refused.
+            #
+            # A handler here would have been worse than useless in any case. Every
+            # client that can meet a refusal overrides this method -- anthropic,
+            # gemini, openai_base and the generic client all have their own -- and
+            # only GroqClient, which never raises one, reaches this line.
             try:
                 response = await self._generate_response_with_retry(
                     messages, response_model, max_tokens, model_size
