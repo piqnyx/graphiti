@@ -377,7 +377,11 @@ class OpenAIGenericClient(LLMClient):
             # transient fault and was retried forever -- one refused batch held the
             # head of its queue for ten hours and thirty-nine attempts.
             message = getattr(choice, 'message', None)
-            result = (getattr(message, 'content', None) or '') if message is not None else ''
+            # `getattr` уже отвечает за оба случая: и когда `message` отсутствует,
+            # и когда он есть и равен None -- второе как раз и присылает SDK на
+            # отказ. Отдельная ветка под None была неразличима ни одним тестом,
+            # потому что различать там нечего.
+            result = getattr(message, 'content', None) or ''
             finish_reason = getattr(choice, 'finish_reason', None)
             usage = getattr(response, 'usage', None)
             completion_tokens = _completion_tokens(usage)
