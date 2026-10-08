@@ -81,6 +81,27 @@ def _make_client(
     return client, completions
 
 
+def test_the_client_waits_longer_than_the_proxy_s_chain_by_default(monkeypatch):
+    # The ladder of timeouts (gemini-proxy PLAN-gorizont 6, 08.10): every caller waits
+    # longer than the proxy's chain of attempts (870 s), or the proxy answers into the
+    # void and the extraction is repeated. The SDK's own default is 600 s.
+    monkeypatch.delenv('GRAPHITI_LLM_TIMEOUT_S', raising=False)
+    client = OpenAIGenericClient(config=LLMConfig(api_key='x', base_url='http://door.test/v1'))
+    assert client.client.timeout.read == 960.0
+    assert client.client.timeout.write == 960.0
+    assert client.client.timeout.pool == 960.0
+    assert client.client.timeout.connect == 5.0, "the SDK's own connect timeout stays"
+
+
+def test_the_wait_is_the_environment_s_when_it_names_one(monkeypatch):
+    monkeypatch.setenv('GRAPHITI_LLM_TIMEOUT_S', '45')
+    client = OpenAIGenericClient(config=LLMConfig(api_key='x', base_url='http://door.test/v1'))
+    assert client.client.timeout.read == 45.0
+    monkeypatch.setenv('GRAPHITI_LLM_TIMEOUT_S', 'soon')
+    client = OpenAIGenericClient(config=LLMConfig(api_key='x', base_url='http://door.test/v1'))
+    assert client.client.timeout.read == 960.0, 'rubbish falls back to the default'
+
+
 @pytest.mark.asyncio
 async def test_defaults_to_json_schema_response_format():
     client, completions = _make_client()
