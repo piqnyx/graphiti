@@ -16,10 +16,12 @@ limitations under the License.
 
 import typing
 
+import httpx
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel
 
+from .client import llm_timeout_seconds
 from .config import DEFAULT_MAX_TOKENS, LLMConfig
 from .openai_base_client import DEFAULT_REASONING, DEFAULT_VERBOSITY, BaseOpenAIClient
 
@@ -58,7 +60,13 @@ class OpenAIClient(BaseOpenAIClient):
             config = LLMConfig()
 
         if client is None:
-            self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+            # The SDK's connect timeout (5 s) stays: only the wait for the answer is
+            # the proxy's chain long.
+            self.client = AsyncOpenAI(
+                api_key=config.api_key,
+                base_url=config.base_url,
+                timeout=httpx.Timeout(llm_timeout_seconds(), connect=5.0),
+            )
         else:
             self.client = client
 

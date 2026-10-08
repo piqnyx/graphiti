@@ -36,6 +36,30 @@ DEFAULT_TEMPERATURE = 0
 DEFAULT_CACHE_DIR = './llm_cache'
 
 
+DEFAULT_LLM_TIMEOUT_S = 960.0
+
+
+def llm_timeout_seconds() -> float:
+    """How long one call to the model may take before the SDK gives up.
+
+    The SDK's own default is 600 s. Behind a proxy that retries the door on its
+    side (gemini-proxy: a request budget of 870 s, with the ladder of timeouts
+    outside it 960 > 930 > 900), 600 cut a call the proxy was still working on,
+    and the server retried a request that would have been answered. The default
+    here is the rung above the proxy's budget; GRAPHITI_LLM_TIMEOUT_S names
+    another, and a value that is not a number falls back to the default.
+    """
+    configured = os.environ.get('GRAPHITI_LLM_TIMEOUT_S', '').strip()
+    if configured:
+        try:
+            seconds = float(configured)
+        except ValueError:
+            return DEFAULT_LLM_TIMEOUT_S
+        if seconds > 0:
+            return seconds
+    return DEFAULT_LLM_TIMEOUT_S
+
+
 def get_extraction_language_instruction(group_id: str | None = None) -> str:
     """Returns instruction for language extraction behavior.
 

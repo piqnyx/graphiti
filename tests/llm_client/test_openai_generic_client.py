@@ -88,7 +88,9 @@ def test_the_client_waits_longer_than_the_proxy_s_chain_by_default(monkeypatch):
     monkeypatch.delenv('GRAPHITI_LLM_TIMEOUT_S', raising=False)
     client = OpenAIGenericClient(config=LLMConfig(api_key='x', base_url='http://door.test/v1'))
     assert client.client.timeout.read == 960.0
-    assert client.client.timeout.connect == 960.0
+    assert client.client.timeout.write == 960.0
+    assert client.client.timeout.pool == 960.0
+    assert client.client.timeout.connect == 5.0, "the SDK's own connect timeout stays"
 
 
 def test_the_wait_is_the_environment_s_when_it_names_one(monkeypatch):

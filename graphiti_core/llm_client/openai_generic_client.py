@@ -25,13 +25,14 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
+import httpx
 import openai
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel
 
 from ..prompts.models import Message
-from .client import LLMClient, get_extraction_language_instruction
+from .client import LLMClient, get_extraction_language_instruction, llm_timeout_seconds
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
 from .errors import EmptyResponseError, OutputLimitError, RateLimitError, RefusalError
 
@@ -276,7 +277,13 @@ class OpenAIGenericClient(LLMClient):
         self.structured_output_mode: StructuredOutputMode = structured_output_mode
 
         if client is None:
-            self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+            # The SDK's connect timeout (5 s) stays: only the wait for the answer is
+            # the proxy's chain long.
+            self.client = AsyncOpenAI(
+                api_key=config.api_key,
+                base_url=config.base_url,
+                timeout=httpx.Timeout(llm_timeout_seconds(), connect=5.0),
+            )
         else:
             self.client = client
 
