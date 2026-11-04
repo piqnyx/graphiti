@@ -204,6 +204,14 @@ async def edge_fulltext_search(
     YIELD relationship AS rel, score
     MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
     """
+    if driver.provider == GraphProvider.FALKORDB:
+        # FalkorDB plans the uuid re-MATCH as a scan of every Entity per hit (hits x entities,
+        # 20-70 s and timeouts on a 1373-fact graph). The hits already are the relationships,
+        # so take their ends directly (upstream #1500); the Entity guard is kept below.
+        match_query = """
+    YIELD relationship AS e, score
+    WITH e, score, startNode(e) AS n, endNode(e) AS m
+    """
     if driver.provider == GraphProvider.KUZU:
         match_query = """
         YIELD node, score
@@ -213,6 +221,9 @@ async def edge_fulltext_search(
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
     )
+    if driver.provider == GraphProvider.FALKORDB:
+        # The uuid re-MATCH also kept only edges between two Entity nodes.
+        filter_queries.insert(0, 'n:Entity AND m:Entity')
 
     if group_ids is not None:
         filter_queries.append('e.group_id IN $group_ids')
