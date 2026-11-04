@@ -6,9 +6,10 @@ read they waited behind it, and every query queued after them waited too. Measur
 piqnyx main graph: a 0.1 s read took 27 s behind one such index command.
 
 A graph is marked indexed only after its build succeeded, so a failed or cancelled build
-is retried by the next driver.
+is retried by the next driver. Drivers created while a build runs do not start another.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -18,9 +19,10 @@ from graphiti_core.driver.falkordb_driver import FalkorDriver
 
 @pytest.fixture
 def build(monkeypatch):
-    # raising=False: before the fix the registry does not exist, and the tests must fail on
+    # raising=False: before the fix the registries do not exist, and the tests must fail on
     # the repeated builds, not on the fixture.
     monkeypatch.setattr(FalkorDriver, '_indexed_graphs', set(), raising=False)
+    monkeypatch.setattr(FalkorDriver, '_indexing_graphs', set(), raising=False)
     build = AsyncMock()
     monkeypatch.setattr(FalkorDriver, 'build_indices_and_constraints', build)
     return build
@@ -64,3 +66,22 @@ async def test_failed_index_build_is_retried_by_next_driver(build):
     after_success = FalkorDriver(falkor_db=client, database='main')
     assert after_success._init_task is None
     assert build.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_drivers_created_during_a_build_do_not_start_another(build):
+    release = asyncio.Event()
+
+    async def slow_build():
+        await release.wait()
+
+    build.side_effect = slow_build
+    client = MagicMock()
+
+    drivers = [FalkorDriver(falkor_db=client, database='main') for _ in range(5)]
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(*(d._init_task for d in drivers if d._init_task is not None))
+
+    assert build.await_count == 1
+    assert FalkorDriver(falkor_db=client, database='main')._init_task is None

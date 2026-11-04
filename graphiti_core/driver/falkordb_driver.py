@@ -133,6 +133,8 @@ class FalkorDriver(GraphDriver):
     # driver; re-sending the index commands per request queued writes behind long reads, which
     # stalled every query after them. Marked only after a build succeeded.
     _indexed_graphs: set[tuple[int, str]] = set()
+    # Builds under way: a driver created meanwhile does not start another.
+    _indexing_graphs: set[tuple[int, str]] = set()
 
     def __init__(
         self,
@@ -334,8 +336,18 @@ class FalkorDriver(GraphDriver):
             await self.execute_query(query)
 
     async def _build_indices_once(self) -> None:
-        await self.build_indices_and_constraints()
-        FalkorDriver._indexed_graphs.add((id(self.client), self._database))
+        key = (id(self.client), self._database)
+        # Checked when the task runs, not when it is scheduled: drivers created together all
+        # schedule before the first build starts, and a task cancelled before it starts never
+        # reaches a finally, so registering at schedule time could leave a build marked forever.
+        if key in FalkorDriver._indexed_graphs or key in FalkorDriver._indexing_graphs:
+            return
+        FalkorDriver._indexing_graphs.add(key)
+        try:
+            await self.build_indices_and_constraints()
+            FalkorDriver._indexed_graphs.add(key)
+        finally:
+            FalkorDriver._indexing_graphs.discard(key)
 
     def clone(self, database: str) -> 'GraphDriver':
         """
