@@ -108,11 +108,13 @@ The fork answered both by raising the constant, first to 65536 and then to 13107
 
 For FalkorDB only, the fork takes the hit's ends with `startNode`/`endNode` — the rewrite upstream PR #1500 proposes — and keeps the old pattern's filter as `n:Entity AND m:Entity`. Compared on the live graph against the original function: identical results (every field, same order) for 87 queries, including digest post gists, fact texts, a date filter and the production candidate pool of 80, in under a second instead of 20–70 s.
 
+The two forms are equal while no two `RELATES_TO` edges share a uuid: the old re-MATCH returned every edge with the hit's uuid, so a duplicate would have been repeated and taken extra `LIMIT` slots. The live graph had none (1373 facts, 1373 distinct uuids). An unused copy of the old pattern remains in `driver/falkordb/operations/search_ops.py`, which nothing calls.
+
 ### FalkorDB indices built once per graph
 
-Upstream schedules a full index build in every `FalkorDriver.__init__`, and every `clone()` creates a new driver, so each request re-sent all eleven index-creation commands. They are writes: behind a long read they waited, and every query arriving after them waited too — a 0.1 s read took 27 s.
+Upstream schedules a full index build in every `FalkorDriver.__init__`, and every `clone()` creates a new driver, so each request re-sent all thirteen index-creation commands (nine range, four fulltext). They are writes: behind a long read they waited, and every query arriving after them waited too — a 0.1 s read took 27 s.
 
-The fork builds once per connection and graph per process, and marks a graph only after its build succeeded, so a failed or cancelled build is retried by the next driver. An explicit `build_indices_and_constraints()` call still always runs. A graph deleted while the server runs gets no indices until the server restarts; the deployment's reset script restarts it.
+The fork builds once per connection and graph per process, and marks a graph only after its build succeeded, so a failed or cancelled build is retried by the next driver. Drivers created while a build runs do not start another. An explicit `build_indices_and_constraints()` call still always runs. A graph deleted while the server runs gets no indices until the server restarts; the deployment's reset script restarts it.
 
 ### Fork-only read-only tools
 
