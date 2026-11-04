@@ -85,3 +85,21 @@ async def test_drivers_created_during_a_build_do_not_start_another(build):
 
     assert build.await_count == 1
     assert FalkorDriver(falkor_db=client, database='main')._init_task is None
+
+
+@pytest.mark.asyncio
+async def test_build_cancelled_before_it_starts_does_not_block_the_graph(build):
+    # A task cancelled before it runs never reaches its finally. Registering the build when it
+    # is scheduled would leave the mark set, and no later driver would build the graph.
+    client = MagicMock()
+
+    cancelled = FalkorDriver(falkor_db=client, database='main')
+    assert cancelled._init_task is not None
+    cancelled._init_task.cancel()
+
+    next_driver = FalkorDriver(falkor_db=client, database='main')
+    assert next_driver._init_task is not None
+    await next_driver._init_task
+
+    assert build.await_count == 1
+    assert FalkorDriver(falkor_db=client, database='main')._init_task is None
