@@ -129,6 +129,12 @@ class FalkorDriver(GraphDriver):
     default_group_id: str = '_'
     fulltext_syntax: str = '@'  # FalkorDB uses a redisearch-like syntax for fulltext queries
     aoss_client: None = None
+    # (id(client), graph) pairs this process already built indices for. Every clone() is a new
+    # driver; re-sending the index commands per request queued writes behind long reads, which
+    # stalled every query after them. Marked only after a build succeeded.
+    _indexed_graphs: set[tuple[int, str]] = set()
+    # Builds under way: a driver created meanwhile does not start another.
+    _indexing_graphs: set[tuple[int, str]] = set()
 
     def __init__(
         self,
@@ -179,7 +185,8 @@ class FalkorDriver(GraphDriver):
         # Schedule the indices and constraints to be built
         try:
             loop = asyncio.get_running_loop()
-            self._init_task = loop.create_task(self.build_indices_and_constraints())
+            if (id(self.client), self._database) not in FalkorDriver._indexed_graphs:
+                self._init_task = loop.create_task(self._build_indices_once())
         except RuntimeError:
             pass
 
@@ -327,6 +334,20 @@ class FalkorDriver(GraphDriver):
         index_queries = get_range_indices(self.provider) + get_fulltext_indices(self.provider)
         for query in index_queries:
             await self.execute_query(query)
+
+    async def _build_indices_once(self) -> None:
+        key = (id(self.client), self._database)
+        # Checked when the task runs, not when it is scheduled: drivers created together all
+        # schedule before the first build starts, and a task cancelled before it starts never
+        # reaches a finally, so registering at schedule time could leave a build marked forever.
+        if key in FalkorDriver._indexed_graphs or key in FalkorDriver._indexing_graphs:
+            return
+        FalkorDriver._indexing_graphs.add(key)
+        try:
+            await self.build_indices_and_constraints()
+            FalkorDriver._indexed_graphs.add(key)
+        finally:
+            FalkorDriver._indexing_graphs.discard(key)
 
     def clone(self, database: str) -> 'GraphDriver':
         """

@@ -917,9 +917,10 @@ async def search_memory_facts(
             # answer on another subject, the conversation's vector returned eight
             # candidates and not one of them was about those people, while the graph
             # held several -- and no amount of reranking rescues a candidate that was
-            # never fetched. The remark cannot help through the text half either: this
-            # fork's fulltext branch is dead on FalkorDB, so the vector is the whole of
-            # retrieval.
+            # never fetched. The remark cannot help through the text half either: on
+            # FalkorDB the fulltext branch drops a query of 64 or more words for one group
+            # id (`build_falkor_fulltext_query` counts the ` | ` joins against 128), so for a
+            # conversation-length query the vector is the whole of retrieval.
             #
             # The remark speaks first in the merge, so when the two disagree the
             # question just asked outranks the subject being left behind.
