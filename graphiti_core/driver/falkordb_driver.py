@@ -129,6 +129,10 @@ class FalkorDriver(GraphDriver):
     default_group_id: str = '_'
     fulltext_syntax: str = '@'  # FalkorDB uses a redisearch-like syntax for fulltext queries
     aoss_client: None = None
+    # (id(client), graph) pairs this process already built indices for. Every clone() is a new
+    # driver; re-sending the index commands per request queued writes behind long reads, which
+    # stalled every query after them. Marked only after a build succeeded.
+    _indexed_graphs: set[tuple[int, str]] = set()
 
     def __init__(
         self,
@@ -179,7 +183,8 @@ class FalkorDriver(GraphDriver):
         # Schedule the indices and constraints to be built
         try:
             loop = asyncio.get_running_loop()
-            self._init_task = loop.create_task(self.build_indices_and_constraints())
+            if (id(self.client), self._database) not in FalkorDriver._indexed_graphs:
+                self._init_task = loop.create_task(self._build_indices_once())
         except RuntimeError:
             pass
 
@@ -327,6 +332,10 @@ class FalkorDriver(GraphDriver):
         index_queries = get_range_indices(self.provider) + get_fulltext_indices(self.provider)
         for query in index_queries:
             await self.execute_query(query)
+
+    async def _build_indices_once(self) -> None:
+        await self.build_indices_and_constraints()
+        FalkorDriver._indexed_graphs.add((id(self.client), self._database))
 
     def clone(self, database: str) -> 'GraphDriver':
         """
