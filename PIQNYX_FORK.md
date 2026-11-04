@@ -102,6 +102,18 @@ The pin mattered because the target deployment runs a reasoning backend, where `
 
 The fork answered both by raising the constant, first to 65536 and then to 131072. The second raise changed nothing: `OpenAIGenericClient` clamps an explicit request to the deployment ceiling — `min(requested, self.max_tokens)`, covered by `test_explicit_prompt_budget_cannot_exceed_deployment_ceiling` — so a pin above that ceiling asks for nothing extra and only misdescribes the call. Passing no budget at all leaves one knob that means what it says: set the deployment's budget and this call follows it.
 
+### FalkorDB fact search without a per-hit graph scan
+
+`edge_fulltext_search` in `graphiti_core/search/search_utils.py` is the path FalkorDB runs (`driver.search_interface` is never assigned). Upstream re-matches every fulltext hit by uuid, `MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)`, which FalkorDB plans as a scan of every Entity node per hit, so a broad query costs hits × entities. On the deployment's 1373-fact graph, digest queries took 20–70 s and hit the 30 s query timeout.
+
+For FalkorDB only, the fork takes the hit's ends with `startNode`/`endNode` — the rewrite upstream PR #1500 proposes — and keeps the old pattern's filter as `n:Entity AND m:Entity`. Compared on the live graph against the original function: identical results (every field, same order) for 87 queries, including digest post gists, fact texts, a date filter and the production candidate pool of 80, in under a second instead of 20–70 s.
+
+### FalkorDB indices built once per graph
+
+Upstream schedules a full index build in every `FalkorDriver.__init__`, and every `clone()` creates a new driver, so each request re-sent all eleven index-creation commands. They are writes: behind a long read they waited, and every query arriving after them waited too — a 0.1 s read took 27 s.
+
+The fork builds once per connection and graph per process, and marks a graph only after its build succeeded, so a failed or cancelled build is retried by the next driver. An explicit `build_indices_and_constraints()` call still always runs. A graph deleted while the server runs gets no indices until the server restarts; the deployment's reset script restarts it.
+
 ### Fork-only read-only tools
 
 Four MCP tools exist only here. Each lives in its own `piqnyx_*` module and is
