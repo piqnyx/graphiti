@@ -325,3 +325,23 @@ async def test_a_failed_second_question_keeps_the_first_answer(world, caplog):
     assert resolved[1].uuid == world.ann.uuid
     assert pairs == [(world.joe, world.joseph)]
     assert any('Ann' in r.getMessage() and 'RefusalError' in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hidden', ['​', '⁠', '﻿', '\x07'])
+async def test_characters_the_client_strips_do_not_fail_the_name_check(world, monkeypatch, hidden):
+    # The client takes zero-width and control characters out of the prompt before it goes,
+    # so the model repeats the name without them; the check must not hold that against it.
+    acme = _node(f'Acme{hidden}Corp')
+
+    async def search(*_, **__):
+        return [[acme], [world.annie]]
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search', search
+    )
+    llm = ScriptedLLM([_answer((0, 'Joe', 2, 'AcmeCorp'), (1, 'Ann', -1, ''))])
+    resolved, _, _ = await _resolve(llm, world)
+
+    assert len(llm.calls) == 1
+    assert resolved[0].uuid == acme.uuid
