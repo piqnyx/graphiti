@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import unicodedata
 from collections.abc import Awaitable, Callable
 from time import time
 from typing import Any
@@ -465,10 +466,23 @@ def _commit_resolution(
 
 
 def _same_name(answered: str | None, name: str | None) -> bool:
-    """Whether the name a dedupe answer repeats is the candidate's: case, spacing and ё/е aside."""
+    """Whether the name a dedupe answer repeats is the candidate's: case, spacing and ё/е aside.
+
+    Invisible characters do not count either. The client takes zero-width and control
+    characters out of the prompt before it is sent (``LLMClient._clean_input``), so the model
+    repeats a name without them; format characters, surrogates and controls other than line
+    breaks and tabs are dropped from both sides here, a superset of what the client drops.
+    """
+
+    def visible(char: str) -> bool:
+        category = unicodedata.category(char)
+        if category in ('Cf', 'Cs'):
+            return False
+        return category != 'Cc' or char in '\n\r\t'
 
     def plain(value: str | None) -> str:
-        return _normalize_string_exact(value or '').replace('ё', 'е')
+        kept = ''.join(char for char in (value or '') if visible(char))
+        return _normalize_string_exact(kept).replace('ё', 'е')
 
     return plain(answered) == plain(name)
 
