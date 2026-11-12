@@ -9,8 +9,9 @@ code took every such answer as it came. Measured on the recorded trace, 60 such 
 entity's own candidates under it and candidate numbers that never coincide with entity numbers.
 
 The answer is checked as well: a merge is taken only with a candidate from that entity's own
-list, named as that candidate is named. Anything else is asked again once, for those entities
-alone; what still fails stays a new entity rather than a wrong merge.
+list, named as that candidate is named. Anything else is asked again, for those entities alone,
+up to GRAPHITI_DEDUPE_REASKS times (once when unset); what still fails stays a new entity rather
+than a wrong merge.
 """
 
 import json
@@ -457,4 +458,45 @@ async def test_a_fault_in_building_a_second_question_is_not_swallowed(world, mon
     )
     llm = ScriptedLLM([_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, '')), RIGHT_JOE])
     with pytest.raises(TypeError, match='broken question'):
+        await _resolve(llm, world)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'stored, repeated',
+    [
+        ('Йошкар-Ола', 'Йошкар-Ола'),
+        ("Marco's car", 'Marco’s car'),
+        ('«Дождь»', '"Дождь"'),
+        ('Йошкар‑Ола', 'Йошкар-Ола'),
+    ],
+)
+async def test_the_name_check_ignores_letter_forms_and_punctuation(
+    world, monkeypatch, stored, repeated
+):
+    # A difference the model makes every time it copies a name -- a letter written as one
+    # code point or two, a typographic quote or hyphen -- would fail every second question
+    # alike and spend them all. The check is about whether the number and the name agree.
+    stored_node = _node(stored)
+
+    async def search(*_, **__):
+        return [[stored_node], [world.annie]]
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search', search
+    )
+    llm = ScriptedLLM([_answer((0, 'Joe', 2, repeated), (1, 'Ann', -1, ''))])
+    resolved, _, _ = await _resolve(llm, world)
+
+    assert len(llm.calls) == 1
+    assert resolved[0].uuid == stored_node.uuid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', [TypeError, AttributeError, NameError, AssertionError])
+async def test_a_programming_fault_on_a_second_question_surfaces(world, fault):
+    # The insurance is for the model's side; a fault that signals a bug in our own code --
+    # the client included -- must not turn into "kept with no duplicate".
+    llm = ScriptedLLM([_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, '')), fault('our bug')])
+    with pytest.raises(fault, match='our bug'):
         await _resolve(llm, world)
