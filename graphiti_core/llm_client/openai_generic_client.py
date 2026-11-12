@@ -558,7 +558,9 @@ class OpenAIGenericClient(LLMClient):
                 raise failure
             logger.warning(
                 'LLM output limit reached (prompt=%s) at reasoning %r; asking again at %r',
-                prompt_name, level or 'unset', lower,
+                prompt_name,
+                level or 'unset',
+                lower,
             )
             token = _REASONING_STEP.set(lower)
             try:
