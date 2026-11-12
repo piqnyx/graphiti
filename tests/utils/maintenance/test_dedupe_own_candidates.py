@@ -72,6 +72,12 @@ def _node(name):
     return EntityNode(name=name, group_id='group', labels=['Entity'])
 
 
+@pytest.fixture(autouse=True)
+def reasks_unset(monkeypatch):
+    """Every test starts from the default number of second questions unless it sets one."""
+    monkeypatch.delenv('GRAPHITI_DEDUPE_REASKS', raising=False)
+
+
 @pytest.fixture
 def world(monkeypatch):
     """Two extracted entities, each with its own two candidates; one candidate is shared.
@@ -304,7 +310,9 @@ async def test_an_entity_left_out_twice_is_named_in_the_log(world, caplog):
     assert len(llm.calls) == 2
     assert resolved[1].uuid == world.ann.uuid
     assert pairs == []
-    assert any('Ann' in r.getMessage() and 'twice' in r.getMessage() for r in caplog.records)
+    assert any(
+        'Ann' in r.getMessage() and 'every question' in r.getMessage() for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -345,3 +353,84 @@ async def test_characters_the_client_strips_do_not_fail_the_name_check(world, mo
 
     assert len(llm.calls) == 1
     assert resolved[0].uuid == acme.uuid
+
+
+WRONG_JOE = _answer((0, 'Joe', 4, 'Annie'))
+RIGHT_JOE = _answer((0, 'Joe', 2, 'Joseph'))
+
+
+@pytest.mark.asyncio
+async def test_with_no_second_questions_a_failed_answer_keeps_no_duplicate(
+    world, monkeypatch, caplog
+):
+    monkeypatch.setenv('GRAPHITI_DEDUPE_REASKS', '0')
+    llm = ScriptedLLM([_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, '')), RIGHT_JOE])
+    with caplog.at_level(logging.WARNING):
+        resolved, _, pairs = await _resolve(llm, world)
+
+    assert len(llm.calls) == 1
+    assert [n.uuid for n in resolved] == [world.joe.uuid, world.ann.uuid]
+    assert pairs == []
+    assert any(
+        'Joe' in r.getMessage() and 'every question' in r.getMessage() for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_failing_are_asked_again_until_they_pass(world, monkeypatch):
+    monkeypatch.setenv('GRAPHITI_DEDUPE_REASKS', '10')
+    llm = ScriptedLLM(
+        [_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, '')), WRONG_JOE, RIGHT_JOE, RIGHT_JOE]
+    )
+    resolved, _, _ = await _resolve(llm, world)
+
+    assert len(llm.calls) == 3
+    assert resolved[0].uuid == world.joseph.uuid
+    assert [c['prompt_name'] for c in llm.calls] == [
+        'dedupe_nodes.nodes',
+        'dedupe_nodes.nodes_again',
+        'dedupe_nodes.nodes_again',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_number_of_second_questions_is_a_ceiling(world, monkeypatch):
+    monkeypatch.setenv('GRAPHITI_DEDUPE_REASKS', '10')
+    llm = ScriptedLLM([_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, ''))] + [WRONG_JOE] * 11)
+    resolved, _, pairs = await _resolve(llm, world)
+
+    assert len(llm.calls) == 11
+    assert resolved[0].uuid == world.joe.uuid
+    assert pairs == []
+
+
+@pytest.mark.asyncio
+async def test_each_second_question_holds_only_those_still_failing(world, monkeypatch):
+    monkeypatch.setenv('GRAPHITI_DEDUPE_REASKS', '3')
+    llm = ScriptedLLM(
+        [
+            _answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', 2, 'Joseph')),
+            _answer((0, 'Joe', 2, 'Joseph'), (1, 'Ann', 2, 'Joseph')),
+            _answer((0, 'Ann', 4, 'Annie')),
+        ]
+    )
+    resolved, _, _ = await _resolve(llm, world)
+
+    assert len(llm.calls) == 3
+    assert [(e['id'], e['name']) for e in _entities_in(llm.calls[1])] == [(0, 'Joe'), (1, 'Ann')]
+    assert [(e['id'], e['name']) for e in _entities_in(llm.calls[2])] == [(0, 'Ann')]
+    assert resolved[0].uuid == world.joseph.uuid
+    assert resolved[1].uuid == world.annie.uuid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('setting', ['ten', '-1', '2.5'])
+async def test_a_setting_that_is_not_a_count_asks_again_once(world, monkeypatch, caplog, setting):
+    monkeypatch.setenv('GRAPHITI_DEDUPE_REASKS', setting)
+    llm = ScriptedLLM([_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, '')), WRONG_JOE, RIGHT_JOE])
+    with caplog.at_level(logging.WARNING):
+        resolved, _, _ = await _resolve(llm, world)
+
+    assert len(llm.calls) == 2
+    assert resolved[0].uuid == world.joe.uuid
+    assert any('GRAPHITI_DEDUPE_REASKS' in r.getMessage() for r in caplog.records)
