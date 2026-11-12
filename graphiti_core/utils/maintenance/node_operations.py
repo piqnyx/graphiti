@@ -627,9 +627,10 @@ async def _resolve_with_llm(
             'previous_episodes': previous_episodes_context,
         }
 
-    async def ask(originals: list[int], prompt_name: str) -> list[NodeDuplicate]:
+    async def ask(messages: list[Any], prompt_name: str) -> list[NodeDuplicate]:
+        """The model's answer to a question already built: the request and its reading."""
         llm_response = await llm_client.generate_response(
-            prompt_library.dedupe_nodes.nodes(question(originals)),
+            messages,
             response_model=NodeResolutions,
             prompt_name=prompt_name,
         )
@@ -734,7 +735,10 @@ async def _resolve_with_llm(
 
     again = settle(
         state.unresolved_indices,
-        await ask(state.unresolved_indices, 'dedupe_nodes.nodes'),
+        await ask(
+            prompt_library.dedupe_nodes.nodes(question(state.unresolved_indices)),
+            'dedupe_nodes.nodes',
+        ),
         last=questions == 1,
     )
     for asked in range(2, questions + 1):
@@ -749,11 +753,14 @@ async def _resolve_with_llm(
             asked - 1,
             questions - 1,
         )
-        # Asking again is insurance. When it fails -- a refusal, a limit, a network fault --
-        # these entities stay new and the episode goes on with what was settled before;
-        # before the check existed, the episode would have gone on too.
+        # Asking again is insurance. When the model's side of it fails -- a refusal, a limit,
+        # a network fault, an answer that does not read -- these entities stay new and the
+        # episode goes on with what was settled before; before the check existed, the episode
+        # would have gone on too. Building the question is our own code and stays outside:
+        # a fault there must surface.
+        messages = prompt_library.dedupe_nodes.nodes(question(again))
         try:
-            answer = await ask(again, 'dedupe_nodes.nodes_again')
+            answer = await ask(messages, 'dedupe_nodes.nodes_again')
         except Exception as error:
             logger.warning(
                 'Asking again failed (%s: %s); %s kept with no duplicate.',
