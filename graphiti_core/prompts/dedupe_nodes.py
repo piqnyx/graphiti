@@ -30,7 +30,14 @@ class NodeDuplicate(BaseModel):
     )
     duplicate_candidate_id: int = Field(
         ...,
-        description='candidate_id of the matching EXISTING ENTITY, or -1 if no duplicate exists.',
+        description='candidate_id of the matching candidate listed under this entity, or -1 if none of its candidates is a duplicate.',
+    )
+    # Fork (13.11): the answer names the candidate it picks, so a slip in the number is caught
+    # by the code instead of attaching facts to whatever entity that number happens to be
+    # (`_resolve_with_llm`).
+    duplicate_candidate_name: str = Field(
+        ...,
+        description='name of that candidate, copied exactly as written in its list, or an empty string when duplicate_candidate_id is -1.',
     )
 
 
@@ -114,6 +121,12 @@ Result: duplicate_candidate_id = 0 (synonym — "car" and "vehicle" refer to the
     ]
 
 
+# Fork (13.11): each entity carries its own candidates (`candidates`), numbered after the
+# entities so a candidate number never coincides with an entity number. Upstream lists every
+# entity's candidates in one EXISTING ENTITIES block numbered from zero; on long lists the model
+# wrote an entity's own number as the candidate's -- 60 such merges in 25 of 529 recorded calls,
+# 30 in a replay of the 20 largest at high, none in the same replay with this prompt (word for
+# word what was measured). See `_resolve_with_llm`.
 def nodes(context: dict[str, Any]) -> list[Message]:
     return [
         Message(
@@ -136,17 +149,15 @@ def nodes(context: dict[str, Any]) -> list[Message]:
 {to_prompt_json(context['extracted_nodes'])}
 </ENTITIES>
 
-<EXISTING ENTITIES>
-{to_prompt_json(context['existing_nodes'])}
-</EXISTING ENTITIES>
-
-Each of the above ENTITIES was extracted from the CURRENT MESSAGE.
-For each entity, determine if it is a duplicate of any EXISTING ENTITY.
+Each of the above ENTITIES was extracted from the CURRENT MESSAGE. Under each entity, `candidates` lists the existing entities whose names are closest to it.
+For each entity, determine if it is a duplicate of one of ITS OWN candidates.
 Entities should only be considered duplicates if they refer to the *same real-world object or concept*.
 
 NEVER mark entities as duplicates if:
 - They are related but distinct.
 - They have similar names or purposes but refer to separate instances or concepts.
+
+A duplicate can only be a candidate listed under that same entity. Candidate ids never coincide with entity ids.
 
 Task:
 ENTITIES contains {len(context['extracted_nodes'])} entities with IDs 0 through {len(context['extracted_nodes']) - 1}.
@@ -155,24 +166,21 @@ Your response MUST include EXACTLY {len(context['extracted_nodes'])} resolutions
 For every entity, provide:
 - `id`: integer id from ENTITIES
 - `name`: the best full name for the entity (preserve the original name unless a duplicate has a more complete name)
-- `duplicate_candidate_id`: the `candidate_id` of the EXISTING ENTITY that is the best duplicate match, or -1 if there is no duplicate
+- `duplicate_candidate_id`: the `candidate_id` of the candidate listed under this entity that is the best duplicate match, or -1 if there is no duplicate
+- `duplicate_candidate_name`: the `name` of that candidate, copied exactly as written in its list, or an empty string if `duplicate_candidate_id` is -1
 
 <EXAMPLE>
-ENTITY: "Sam" (Person)
-EXISTING ENTITIES: [{{"candidate_id": 0, "name": "Sam", "entity_types": ["Person"], "summary": "Sam enjoys hiking and photography"}}]
-Result: duplicate_candidate_id = 0 (same person referenced in conversation)
+ENTITY: "Sam" (Person), candidates: [{{"candidate_id": 7, "name": "Sam", "entity_types": ["Person"], "summary": "Sam enjoys hiking and photography"}}]
+Result: duplicate_candidate_id = 7, duplicate_candidate_name = "Sam" (same person referenced in conversation)
 
-ENTITY: "NYC"
-EXISTING ENTITIES: [{{"candidate_id": 0, "name": "New York City", "entity_types": ["Location"]}}, {{"candidate_id": 1, "name": "New York Knicks", "entity_types": ["Organization"]}}]
-Result: duplicate_candidate_id = 0 (same location, abbreviated name)
+ENTITY: "NYC", candidates: [{{"candidate_id": 12, "name": "New York City", "entity_types": ["Location"]}}, {{"candidate_id": 13, "name": "New York Knicks", "entity_types": ["Organization"]}}]
+Result: duplicate_candidate_id = 12, duplicate_candidate_name = "New York City" (same location, abbreviated name)
 
-ENTITY: "Java" (programming language)
-EXISTING ENTITIES: [{{"candidate_id": 0, "name": "Java", "entity_types": ["Location"], "summary": "An island in Indonesia"}}]
-Result: duplicate_candidate_id = -1 (same name but distinct real-world things)
+ENTITY: "Java" (programming language), candidates: [{{"candidate_id": 9, "name": "Java", "entity_types": ["Location"], "summary": "An island in Indonesia"}}]
+Result: duplicate_candidate_id = -1, duplicate_candidate_name = "" (same name but distinct real-world things)
 
-ENTITY: "Marco's car"
-EXISTING ENTITIES: [{{"candidate_id": 0, "name": "Marco's vehicle", "entity_types": ["Entity"], "summary": "Marco drives a red sedan."}}]
-Result: duplicate_candidate_id = 0 (synonym — "car" and "vehicle" refer to the same thing, same possessor)
+ENTITY: "Marco's car", candidates: [{{"candidate_id": 4, "name": "Marco's vehicle", "entity_types": ["Entity"], "summary": "Marco drives a red sedan."}}]
+Result: duplicate_candidate_id = 4, duplicate_candidate_name = "Marco's vehicle" (synonym — "car" and "vehicle" refer to the same thing, same possessor)
 </EXAMPLE>
 """,
         ),
