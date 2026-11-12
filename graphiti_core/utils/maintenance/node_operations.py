@@ -538,12 +538,16 @@ async def _resolve_with_llm(
     # A candidate's number is the entity count of the first question plus its place in the
     # shared list -- the same in the first question and in the second, and never an entity's
     # number. Each entity's own candidates by number are what its answer is checked against.
+    # The node behind a number is the shared list's copy: every search returns its own copy of
+    # a graph node, and two entities merged into one node must land on one copy, as they did.
     first_count = len(state.unresolved_indices)
     first_relative_id = {original: i for i, original in enumerate(state.unresolved_indices)}
     place_by_uuid = {node.uuid: i for i, node in enumerate(indexes.existing_nodes)}
     own_by_number: dict[int, dict[int, EntityNode]] = {
         original: {
-            first_count + place_by_uuid[candidate.uuid]: candidate
+            first_count + place_by_uuid[candidate.uuid]: indexes.existing_nodes[
+                place_by_uuid[candidate.uuid]
+            ]
             for candidate in candidates_by_extracted[original]
         }
         for original in state.unresolved_indices
@@ -678,6 +682,12 @@ async def _resolve_with_llm(
 
         if not last:
             failed.extend(originals[i] for i in missing_ids)
+        else:
+            for i in sorted(missing_ids):
+                logger.warning(
+                    'Dedupe answer left out %r twice; treating as no duplicate.',
+                    extracted_nodes[originals[i]].name,
+                )
         return sorted(set(failed))
 
     again = settle(
@@ -693,7 +703,20 @@ async def _resolve_with_llm(
             first_count,
             ', '.join(repr(extracted_nodes[i].name) for i in again),
         )
-        settle(again, await ask(again, 'dedupe_nodes.nodes_again'), last=True)
+        # Asking again is insurance. When it fails -- a refusal, a limit, a network fault --
+        # these entities stay new and the episode goes on with what the first answer settled;
+        # before the check existed, the episode would have gone on too.
+        try:
+            second = await ask(again, 'dedupe_nodes.nodes_again')
+        except Exception as error:
+            logger.warning(
+                'Asking again failed (%s: %s); %s kept with no duplicate.',
+                type(error).__name__,
+                error,
+                ', '.join(repr(extracted_nodes[i].name) for i in again),
+            )
+            return
+        settle(again, second, last=True)
 
 
 async def resolve_extracted_nodes(

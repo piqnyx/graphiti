@@ -275,7 +275,9 @@ async def test_two_entities_merged_into_one_node_land_on_one_copy_of_it(monkeypa
     joe = EntityNode(name='Joe', group_id='group', labels=['Entity', 'Person'])
     ann = _node('Ann')
     found_by_joe = _node('Joseph')
-    found_by_ann = EntityNode(uuid=found_by_joe.uuid, name='Joseph', group_id='group', labels=['Entity'])
+    found_by_ann = EntityNode(
+        uuid=found_by_joe.uuid, name='Joseph', group_id='group', labels=['Entity']
+    )
 
     async def search(*_, **__):
         return [[found_by_joe], [found_by_ann]]
@@ -322,6 +324,4 @@ async def test_a_failed_second_question_keeps_the_first_answer(world, caplog):
     assert resolved[0].uuid == world.joseph.uuid
     assert resolved[1].uuid == world.ann.uuid
     assert pairs == [(world.joe, world.joseph)]
-    assert any(
-        'Ann' in r.getMessage() and 'RefusalError' in r.getMessage() for r in caplog.records
-    )
+    assert any('Ann' in r.getMessage() and 'RefusalError' in r.getMessage() for r in caplog.records)
