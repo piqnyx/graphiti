@@ -44,6 +44,44 @@ _TRACE_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
 )
 
 
+# The reasoning ladder (fork, 12.11). A call that runs into its output limit is asked again at
+# once, one level of reasoning lower, down to the lowest -- only that call; the next one starts
+# again at the deployment's level. Why: on Google the reasoning counts against the output limit,
+# and an episode of `main` failed three times running on gemini-3.1-flash-lite with 62 912 tokens
+# of reasoning and 2 609 of answer against 65 536, finish "length"; the durable queue sent it again
+# every 300 s at the same level and the graph stood behind it.
+#
+# The bottom step is "none". Through the piqnyx proxy that is each model's lowest level: the proxy
+# moves a level the target model does not have to its nearest (`level_for`, gemini-proxy) on every
+# attempt, after any fall down its ladder -- the lite models have minimal and no none, the senior
+# ones none and no minimal. Sent straight to Google, a lite model would refuse "none".
+# Off unless GRAPHITI_REASONING_FALLBACK is on: unset, every call behaves as before the ladder.
+_REASONING_LADDER = ('high', 'medium', 'low', 'none')
+_REASONING_LOWEST = frozenset({'minimal', 'none'})
+_REASONING_STEP: ContextVar[str | None] = ContextVar(
+    'graphiti_openai_generic_reasoning_step', default=None
+)
+
+
+def _reasoning_fallback_enabled() -> bool:
+    """Whether a call that runs into its output limit is asked again lower."""
+    switch = os.environ.get('GRAPHITI_REASONING_FALLBACK', '').strip().lower()
+    return switch in {'on', 'true', '1', 'yes'}
+
+
+def _next_reasoning_level(level: str) -> str | None:
+    """The level one step below ``level``; None when it is already the lowest.
+
+    Unset or unknown (a typo in the switch) steps to medium, a level every model has.
+    """
+    current = (level or '').strip().lower()
+    if current in _REASONING_LOWEST:
+        return None
+    if current in _REASONING_LADDER:
+        return _REASONING_LADDER[_REASONING_LADDER.index(current) + 1]
+    return 'medium'
+
+
 def _reasoning_kwargs() -> dict[str, Any]:
     """Reasoning effort for this request, if the deployment asked for one.
 
@@ -74,7 +112,13 @@ def _reasoning_effort() -> str:
 
     On Google ``minimal`` is how a stage says "do not think" -- ``off`` is not a
     valid level and a zero thinking budget is rejected.
+
+    A step of the reasoning ladder (``_REASONING_STEP``), when one is in flight, wins over
+    both switches: it is this call asked again lower after running into its output limit.
     """
+    step = _REASONING_STEP.get()
+    if step is not None:
+        return step
     default = os.environ.get('GRAPHITI_REASONING_EFFORT', '').strip()
     overrides = os.environ.get('GRAPHITI_REASONING_EFFORT_BY_PROMPT', '').strip()
     if not overrides:
@@ -480,6 +524,53 @@ class OpenAIGenericClient(LLMClient):
             )
             raise
 
+    async def _generate_with_reasoning_ladder(
+        self,
+        messages: list[Message],
+        response_model: type[BaseModel] | None,
+        *,
+        max_tokens: int,
+        model_size: ModelSize,
+    ) -> dict[str, typing.Any]:
+        """The call, asked again one level of reasoning lower each time it runs into its
+        output limit, down to the lowest (see ``_REASONING_LADDER``).
+
+        It repeats the inner call, not ``generate_response``: the messages already carry the
+        schema and the language instruction, written into them once, and every step asks
+        with exactly those. A step that fails otherwise -- a refusal, an empty answer, a
+        network fault -- goes up as it would have without the ladder; the last output limit
+        goes to the durable queue as before.
+        """
+        try:
+            return await self._generate_response_with_retry(
+                messages, response_model, max_tokens=max_tokens, model_size=model_size
+            )
+        except OutputLimitError as limit:
+            if not _reasoning_fallback_enabled():
+                raise
+            failure = limit
+
+        prompt_name = (_TRACE_CONTEXT.get() or {}).get('prompt_name')
+        level = _reasoning_effort()
+        while True:
+            lower = _next_reasoning_level(level)
+            if lower is None:
+                raise failure
+            logger.warning(
+                'LLM output limit reached (prompt=%s) at reasoning %r; asking again at %r',
+                prompt_name, level or 'unset', lower,
+            )
+            token = _REASONING_STEP.set(lower)
+            try:
+                return await self._generate_response_with_retry(
+                    messages, response_model, max_tokens=max_tokens, model_size=model_size
+                )
+            except OutputLimitError as again:
+                failure = again
+                level = lower
+            finally:
+                _REASONING_STEP.reset(token)
+
     async def generate_response(
         self,
         messages: list[Message],
@@ -547,7 +638,9 @@ class OpenAIGenericClient(LLMClient):
             try:
                 # Delegate to the base tenacity wrapper so genuinely transient JSON /
                 # rate-limit failures get bounded backoff retries. OutputLimitError is
-                # intentionally not retryable here: the outer durable queue owns that wait.
+                # intentionally not retryable there: the outer durable queue owns that wait --
+                # save the reasoning ladder, which asks it again lower at once when
+                # GRAPHITI_REASONING_FALLBACK is on (`_generate_with_reasoning_ladder`).
                 #
                 # A refusal is not retried at all. It used to go a second time with the
                 # same text spaced differently, which did get answers the compact form
@@ -555,7 +648,7 @@ class OpenAIGenericClient(LLMClient):
                 # request out of a quota that is counted, on a prompt already known to be
                 # refused. A refusal now travels up as it is, named, for the queue to
                 # decide about.
-                return await self._generate_response_with_retry(
+                return await self._generate_with_reasoning_ladder(
                     messages, response_model, max_tokens=max_tokens, model_size=model_size
                 )
             except Exception as e:
