@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from graphiti_core.llm_client.errors import RefusalError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.prompts.dedupe_nodes import NodeResolutions
 from graphiti_core.utils.datetime_utils import utc_now
@@ -37,7 +38,10 @@ class ScriptedLLM:
 
     async def generate_response(self, messages, response_model=None, **kwargs):
         self.calls.append({'messages': messages, 'response_model': response_model, **kwargs})
-        return self.answers.pop(0)
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
 
 def _entities_in(call):
@@ -261,3 +265,63 @@ async def test_the_question_is_asked_again_once_at_most(world):
     assert len(llm.calls) == 2
     assert [n.uuid for n in resolved] == [world.joe.uuid, world.ann.uuid]
     assert pairs == []
+
+
+@pytest.mark.asyncio
+async def test_two_entities_merged_into_one_node_land_on_one_copy_of_it(monkeypatch):
+    # Each search returns its own copy of a graph node. Both merges must land on the one copy
+    # the shared list holds, as they always did, so the type one entity brings reaches the
+    # node the other entity resolves to as well.
+    joe = EntityNode(name='Joe', group_id='group', labels=['Entity', 'Person'])
+    ann = _node('Ann')
+    found_by_joe = _node('Joseph')
+    found_by_ann = EntityNode(uuid=found_by_joe.uuid, name='Joseph', group_id='group', labels=['Entity'])
+
+    async def search(*_, **__):
+        return [[found_by_joe], [found_by_ann]]
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search', search
+    )
+    llm = ScriptedLLM([_answer((0, 'Joe', 2, 'Joseph'), (1, 'Ann', 2, 'Joseph'))])
+    resolved, _, _ = await resolve_extracted_nodes(
+        SimpleNamespace(llm_client=llm), [joe, ann], episode=_episode(), previous_episodes=[]
+    )
+
+    assert len(llm.calls) == 1
+    assert resolved[0] is resolved[1]
+    assert set(resolved[1].labels) == {'Entity', 'Person'}
+
+
+@pytest.mark.asyncio
+async def test_an_entity_left_out_twice_is_named_in_the_log(world, caplog):
+    llm = ScriptedLLM([_answer((0, 'Joe', -1, '')), _answer()])
+    with caplog.at_level(logging.WARNING):
+        resolved, _, pairs = await _resolve(llm, world)
+
+    assert len(llm.calls) == 2
+    assert resolved[1].uuid == world.ann.uuid
+    assert pairs == []
+    assert any('Ann' in r.getMessage() and 'twice' in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_second_question_keeps_the_first_answer(world, caplog):
+    # Asking again is insurance: when it fails, the entities it was for stay new and the
+    # episode goes on with what the first answer settled.
+    llm = ScriptedLLM(
+        [
+            _answer((0, 'Joe', 2, 'Joseph'), (1, 'Ann', 2, 'Joseph')),
+            RefusalError('provider refused the prompt'),
+        ]
+    )
+    with caplog.at_level(logging.WARNING):
+        resolved, _, pairs = await _resolve(llm, world)
+
+    assert len(llm.calls) == 2
+    assert resolved[0].uuid == world.joseph.uuid
+    assert resolved[1].uuid == world.ann.uuid
+    assert pairs == [(world.joe, world.joseph)]
+    assert any(
+        'Ann' in r.getMessage() and 'RefusalError' in r.getMessage() for r in caplog.records
+    )
