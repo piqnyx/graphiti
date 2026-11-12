@@ -467,25 +467,23 @@ def _commit_resolution(
 
 
 def _same_name(answered: str | None, name: str | None) -> bool:
-    """Whether the name a dedupe answer repeats is the candidate's: case, spacing and ё/е aside.
+    """Whether the name a dedupe answer repeats is the candidate's.
 
-    Invisible characters do not count either. The client takes zero-width and control
-    characters out of the prompt before it is sent (``LLMClient._clean_input``), so the model
-    repeats a name without them; format characters, surrogates and controls other than line
-    breaks and tabs are dropped from both sides here, a superset of what the client drops.
+    The check is whether the number and the name agree, so only letters and digits count: each
+    letter in one form (NFKC -- "й" as one code point or as "и" with a combining breve), case
+    aside, ё as е. Spacing, punctuation, quotes, hyphens and the invisible characters the client
+    strips from the prompt (``LLMClient._clean_input``) do not: a model copying a name tends to
+    change them, and the same change on every question would fail every question alike. A name
+    with no letters or digits at all is compared whole.
     """
 
-    def visible(char: str) -> bool:
-        category = unicodedata.category(char)
-        if category in ('Cf', 'Cs'):
-            return False
-        return category != 'Cc' or char in '\n\r\t'
+    def letters(value: str | None) -> str:
+        folded = unicodedata.normalize('NFKC', value or '').casefold().replace('ё', 'е')
+        return ''.join(char for char in folded if char.isalnum())
 
-    def plain(value: str | None) -> str:
-        kept = ''.join(char for char in (value or '') if visible(char))
-        return _normalize_string_exact(kept).replace('ё', 'е')
-
-    return plain(answered) == plain(name)
+    if not letters(name):
+        return (answered or '').strip() == (name or '').strip()
+    return letters(answered) == letters(name)
 
 
 def _dedupe_reasks() -> int:
@@ -761,6 +759,9 @@ async def _resolve_with_llm(
         messages = prompt_library.dedupe_nodes.nodes(question(again))
         try:
             answer = await ask(messages, 'dedupe_nodes.nodes_again')
+        except (TypeError, AttributeError, NameError, AssertionError):
+            # These signal a bug in our own code -- the client included -- not the model.
+            raise
         except Exception as error:
             logger.warning(
                 'Asking again failed (%s: %s); %s kept with no duplicate.',
