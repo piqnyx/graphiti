@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import unicodedata
 from collections.abc import Awaitable, Callable
 from time import time
@@ -487,6 +488,28 @@ def _same_name(answered: str | None, name: str | None) -> bool:
     return plain(answered) == plain(name)
 
 
+def _dedupe_reasks() -> int:
+    """How many times entities whose dedupe answer fails the check are asked again.
+
+    ``GRAPHITI_DEDUPE_REASKS``: unset asks again once; 0 never does, and a failed answer keeps
+    no duplicate at once; anything that is not a whole non-negative number asks again once
+    and says so. Each second question holds only the entities still failing.
+    """
+    raw = os.environ.get('GRAPHITI_DEDUPE_REASKS', '').strip()
+    if not raw:
+        return 1
+    try:
+        count = int(raw)
+    except ValueError:
+        count = -1
+    if count < 0:
+        logger.warning(
+            'GRAPHITI_DEDUPE_REASKS=%r is not a whole non-negative number; asking again once.', raw
+        )
+        return 1
+    return count
+
+
 async def _resolve_with_llm(
     llm_client: LLMClient,
     extracted_nodes: list[EntityNode],
@@ -508,8 +531,10 @@ async def _resolve_with_llm(
     is the entity count plus its place in ``indexes.existing_nodes``, so it never coincides
     with an entity number. A merge is taken only with a candidate from that entity's own list
     whose name the answer repeats; the entities whose answer fails that, or that the answer
-    leaves out, are asked again once, alone. What fails again stays a new entity. A duplicate
-    entity costs a later merge; a wrong merge hangs one thing's facts on another.
+    leaves out, are asked again, alone, up to ``GRAPHITI_DEDUPE_REASKS`` times (once when it
+    is unset), each time only those still failing. What fails every question stays a new
+    entity. A duplicate entity costs a later merge; a wrong merge hangs one thing's facts on
+    another.
     """
     if not state.unresolved_indices:
         return
@@ -555,6 +580,7 @@ async def _resolve_with_llm(
     # The node behind a number is the shared list's copy: every search returns its own copy of
     # a graph node, and two entities merged into one node must land on one copy, as they did.
     first_count = len(state.unresolved_indices)
+    questions = 1 + _dedupe_reasks()
     first_relative_id = {original: i for i, original in enumerate(state.unresolved_indices)}
     place_by_uuid = {node.uuid: i for i, node in enumerate(indexes.existing_nodes)}
     own_by_number: dict[int, dict[int, EntityNode]] = {
@@ -678,9 +704,10 @@ async def _resolve_with_llm(
                     continue
                 else:
                     logger.warning(
-                        'Dedupe answer for %r failed the check twice: candidate %d named %r is %s; '
-                        'treating as no duplicate.',
+                        'Dedupe answer for %r failed the check on every question (%d): candidate %d '
+                        'named %r is %s; treating as no duplicate.',
                         extracted_node.name,
+                        questions,
                         duplicate_candidate_id,
                         resolution.duplicate_candidate_name,
                         'not one of its own'
@@ -699,29 +726,34 @@ async def _resolve_with_llm(
         else:
             for i in sorted(missing_ids):
                 logger.warning(
-                    'Dedupe answer left out %r twice; treating as no duplicate.',
+                    'Dedupe answer left out %r on every question (%d); treating as no duplicate.',
                     extracted_nodes[originals[i]].name,
+                    questions,
                 )
         return sorted(set(failed))
 
     again = settle(
         state.unresolved_indices,
         await ask(state.unresolved_indices, 'dedupe_nodes.nodes'),
-        last=False,
+        last=questions == 1,
     )
-    if again:
+    for asked in range(2, questions + 1):
+        if not again:
+            break
         logger.warning(
             'Dedupe answer failed the check or left out %d of %d entities (%s); asking again for '
-            'them alone.',
+            'them alone (%d of %d).',
             len(again),
             first_count,
             ', '.join(repr(extracted_nodes[i].name) for i in again),
+            asked - 1,
+            questions - 1,
         )
         # Asking again is insurance. When it fails -- a refusal, a limit, a network fault --
-        # these entities stay new and the episode goes on with what the first answer settled;
+        # these entities stay new and the episode goes on with what was settled before;
         # before the check existed, the episode would have gone on too.
         try:
-            second = await ask(again, 'dedupe_nodes.nodes_again')
+            answer = await ask(again, 'dedupe_nodes.nodes_again')
         except Exception as error:
             logger.warning(
                 'Asking again failed (%s: %s); %s kept with no duplicate.',
@@ -730,7 +762,7 @@ async def _resolve_with_llm(
                 ', '.join(repr(extracted_nodes[i].name) for i in again),
             )
             return
-        settle(again, second, last=True)
+        again = settle(again, answer, last=asked == questions)
 
 
 async def resolve_extracted_nodes(
