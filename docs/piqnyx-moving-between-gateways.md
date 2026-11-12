@@ -58,6 +58,20 @@ deduplication (`dedupe_nodes`) with reasoning began returning merges where
 `duplicate_candidate_id == id` — the model copying the row number instead of
 choosing.
 
+On Google the reasoning counts against the output limit, and a call can spend
+the whole of it thinking: on 2026-11-12 an episode failed three times running on
+gemini-3.1-flash-lite with 62 912 tokens of reasoning and 2 609 of answer against
+65 536, finish `length`, and the durable queue sent it again every 300 s at the
+same level. `GRAPHITI_REASONING_FALLBACK=on` turns on the reasoning ladder: a call
+that runs into its output limit is asked again at once one level lower — `high`,
+`medium`, `low`, `none` — and only that call; the next one starts again at the
+level the switches above give it. A stage already at `minimal` or `none` has
+nowhere to step and goes to the queue as before; an unset or unknown level steps
+to `medium`. The bottom step is `none` because the piqnyx proxy moves a level a
+model does not have to its nearest on every attempt: the lite models get
+`minimal`, the senior ones `none`. Sent straight to Google, a lite model would
+refuse `none`. Unset, the ladder is off and every call behaves as before it.
+
 ## Reasoning is billed against the answer
 
 On Google the thinking tokens come out of the same `max_tokens` as the response.

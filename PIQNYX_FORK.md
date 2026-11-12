@@ -102,6 +102,12 @@ The pin mattered because the target deployment runs a reasoning backend, where `
 
 The fork answered both by raising the constant, first to 65536 and then to 131072. The second raise changed nothing: `OpenAIGenericClient` clamps an explicit request to the deployment ceiling — `min(requested, self.max_tokens)`, covered by `test_explicit_prompt_budget_cannot_exceed_deployment_ceiling` — so a pin above that ceiling asks for nothing extra and only misdescribes the call. Passing no budget at all leaves one knob that means what it says: set the deployment's budget and this call follows it.
 
+### Reasoning ladder on an output limit
+
+On 2026-11-12 an episode of `main` failed three times running on gemini-3.1-flash-lite: 62 912 tokens of reasoning and 2 609 of answer against 65 536, finish `length`. The durable queue sends a failed episode again every 300 s at the same reasoning level, so the graph stood behind it.
+
+With `GRAPHITI_REASONING_FALLBACK=on`, `OpenAIGenericClient` asks a call that raised `OutputLimitError` again at once, one level lower: `high`, `medium`, `low`, `none`. Only that call steps down; the next starts again at the level `GRAPHITI_REASONING_EFFORT` / `..._BY_PROMPT` give it. A stage already at `minimal` or `none` does not step, an unset or unknown level steps to `medium`, and the last limit goes to the queue as before. Every other error goes up unchanged. The repeat is of the inner call, so the schema and language instruction are not written into the messages twice. Unset, the switch leaves every call as it was. Worst case per call: four full-budget requests. Covered by `tests/llm_client/test_openai_generic_reasoning_ladder.py`; details in `docs/piqnyx-moving-between-gateways.md`.
+
 ### FalkorDB fact search without a per-hit graph scan
 
 `edge_fulltext_search` in `graphiti_core/search/search_utils.py` is the path FalkorDB runs (`driver.search_interface` is never assigned). Upstream re-matches every fulltext hit by uuid, `MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)`, which FalkorDB plans as a scan of every Entity node per hit, so a broad query costs hits × entities. On the deployment's 1373-fact graph, digest queries took 20–70 s and hit the 30 s query timeout.
