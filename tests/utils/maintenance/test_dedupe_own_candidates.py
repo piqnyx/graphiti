@@ -198,7 +198,8 @@ async def test_an_entitys_own_number_is_not_a_candidate(world):
     resolved, _, pairs = await _resolve(llm, world)
 
     assert len(llm.calls) == 2
-    assert [e['name'] for e in _entities_in(llm.calls[1])] == ['Ann']
+    # Ann was entity 1 of the first question; alone in the second, she is entity 0 of it.
+    assert [(e['id'], e['name']) for e in _entities_in(llm.calls[1])] == [(0, 'Ann')]
     assert resolved[1].uuid == world.ann.uuid
     assert pairs == []
 
@@ -232,7 +233,7 @@ async def test_a_missing_entity_is_asked_again(world):
     resolved, _, _ = await _resolve(llm, world)
 
     assert len(llm.calls) == 2
-    assert [e['name'] for e in _entities_in(llm.calls[1])] == ['Ann']
+    assert [(e['id'], e['name']) for e in _entities_in(llm.calls[1])] == [(0, 'Ann')]
     assert resolved[1].uuid == world.annie.uuid
 
 
