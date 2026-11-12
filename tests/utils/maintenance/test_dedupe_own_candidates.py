@@ -337,7 +337,7 @@ async def test_a_failed_second_question_keeps_the_first_answer(world, caplog):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('hidden', ['​', '⁠', '﻿', '\x07'])
+@pytest.mark.parametrize('hidden', ['\u200b', '\u2060', '\ufeff', '\x07'])
 async def test_characters_the_client_strips_do_not_fail_the_name_check(world, monkeypatch, hidden):
     # The client takes zero-width and control characters out of the prompt before it goes,
     # so the model repeats the name without them; the check must not hold that against it.
@@ -438,9 +438,10 @@ async def test_a_setting_that_is_not_a_count_asks_again_once(world, monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_a_fault_in_building_a_second_question_is_not_swallowed(world, monkeypatch):
+@pytest.mark.parametrize('fault', [TypeError, KeyError, ValueError])
+async def test_a_fault_in_building_a_second_question_is_not_swallowed(world, monkeypatch, fault):
     # The insurance covers the model's answer, not our own code: a fault in building the
-    # question must surface, not turn into "kept with no duplicate".
+    # question -- of any kind -- must surface, not turn into "kept with no duplicate".
     from graphiti_core.prompts import prompt_library
 
     real = prompt_library.dedupe_nodes.nodes
@@ -449,7 +450,7 @@ async def test_a_fault_in_building_a_second_question_is_not_swallowed(world, mon
     def fault_on_the_second(context):
         built.append(context)
         if len(built) == 2:
-            raise TypeError('broken question')
+            raise fault('broken question')
         return real(context)
 
     monkeypatch.setattr(
@@ -457,7 +458,7 @@ async def test_a_fault_in_building_a_second_question_is_not_swallowed(world, mon
         fault_on_the_second,
     )
     llm = ScriptedLLM([_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, '')), RIGHT_JOE])
-    with pytest.raises(TypeError, match='broken question'):
+    with pytest.raises(fault, match='broken question'):
         await _resolve(llm, world)
 
 
@@ -465,10 +466,10 @@ async def test_a_fault_in_building_a_second_question_is_not_swallowed(world, mon
 @pytest.mark.parametrize(
     'stored, repeated',
     [
-        ('Йошкар-Ола', 'Йошкар-Ола'),
-        ("Marco's car", 'Marco’s car'),
+        ('И\u0306ошкар-Ола', 'Йошкар-Ола'),
+        ("Marco's car", 'Marco\u2019s car'),
         ('«Дождь»', '"Дождь"'),
-        ('Йошкар‑Ола', 'Йошкар-Ола'),
+        ('Йошкар\u2011Ола', 'Йошкар-Ола'),
     ],
 )
 async def test_the_name_check_ignores_letter_forms_and_punctuation(
@@ -500,3 +501,25 @@ async def test_a_programming_fault_on_a_second_question_surfaces(world, fault):
     llm = ScriptedLLM([_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, '')), fault('our bug')])
     with pytest.raises(fault, match='our bug'):
         await _resolve(llm, world)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repeated, merged', [('***', True), (' *** ', True), ('---', False)])
+async def test_a_name_with_no_letters_is_compared_whole(world, monkeypatch, repeated, merged):
+    # Without letters or digits there is nothing to compare by letters; an answer must not
+    # pass merely because it has no letters either.
+    stars = _node('***')
+
+    async def search(*_, **__):
+        return [[stars], [world.annie]]
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search', search
+    )
+    llm = ScriptedLLM(
+        [_answer((0, 'Joe', 2, repeated), (1, 'Ann', -1, '')), _answer((0, 'Joe', 2, repeated))]
+    )
+    resolved, _, _ = await _resolve(llm, world)
+
+    assert (resolved[0].uuid == stars.uuid) is merged
+    assert len(llm.calls) == (1 if merged else 2)
