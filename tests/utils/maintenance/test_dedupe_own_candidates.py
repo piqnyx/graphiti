@@ -434,3 +434,27 @@ async def test_a_setting_that_is_not_a_count_asks_again_once(world, monkeypatch,
     assert len(llm.calls) == 2
     assert resolved[0].uuid == world.joe.uuid
     assert any('GRAPHITI_DEDUPE_REASKS' in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_fault_in_building_a_second_question_is_not_swallowed(world, monkeypatch):
+    # The insurance covers the model's answer, not our own code: a fault in building the
+    # question must surface, not turn into "kept with no duplicate".
+    from graphiti_core.prompts import prompt_library
+
+    real = prompt_library.dedupe_nodes.nodes
+    built = []
+
+    def fault_on_the_second(context):
+        built.append(context)
+        if len(built) == 2:
+            raise TypeError('broken question')
+        return real(context)
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
+        fault_on_the_second,
+    )
+    llm = ScriptedLLM([_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, '')), RIGHT_JOE])
+    with pytest.raises(TypeError, match='broken question'):
+        await _resolve(llm, world)
