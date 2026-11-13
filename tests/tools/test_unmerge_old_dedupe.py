@@ -1651,3 +1651,101 @@ def test_a_planned_node_is_offered_only_within_the_fifteen_nearest(db, monkeypat
     assert by_entity(plan)[('Альфа', 'W1')]['decision'] == 'new'
     (offered,) = llm.offered['Бета']
     assert len(offered) == 15 and 'Альфа' not in offered
+
+
+@needs_db
+def test_preflight_takes_the_plans_own_namesakes_for_its_own(db):
+    from tools.unmerge_old_dedupe import preflight
+
+    g = db.select_graph('probe')
+    # Half a write done: two new nodes of one name the plan made are already there.
+    g.query("CREATE (:Entity {uuid: 'n1', name: 'Дубль'}), (:Entity {uuid: 'n2', name: 'Дубль'})")
+    node = {'graph': 'probe', 'name': 'Дубль', 'namesakes': []}
+    ops = {
+        'new_nodes': [dict(node, uuid='n1'), dict(node, uuid='n2')],
+        'mentions_add': [],
+        'mentions_drop': [],
+        'edge_moves': [],
+        'summary_edits': [],
+    }
+    assert preflight(g, ops) == []
+
+
+@needs_db
+def test_one_name_twice_in_one_episode_is_left_whole_after_the_first(db):
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        twice = cases(episodes, sanctions)
+        first = next(c for c in twice if c['entity'] == 'Пентагон')
+        twice.append(dict(first, entity='пентагон '))
+        return await make_plan(twice, [GROUP], services())
+
+    plan = asyncio.run(run())
+    assert [n['name'] for n in plan['new_nodes']].count('Пентагон') == 1
+    assert [p for p in plan['problems'] if p['entity'] == 'пентагон ' and p['skipped']]
+
+
+@needs_db
+def test_the_scratch_copy_is_removed_when_the_plan_fails(db, monkeypatch):
+    import tools.unmerge_old_dedupe  # noqa: F401
+    from graphiti_core.utils.maintenance import node_operations
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError('the model is gone')
+
+    monkeypatch.setattr(node_operations, 'resolve_extracted_nodes', broken)
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        await make_plan(cases(episodes, sanctions), [GROUP], services())
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(run())
+    assert not [n for n in db.list_graphs() if n.endswith('__unmerge_plan')]
+
+
+@needs_db
+def test_a_scratch_copy_already_there_stops_the_plan_unless_cleared(db):
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def run(clear):
+        driver, episodes, made, sanctions = await seed()
+        db.select_graph('main__unmerge_plan').query(
+            "CREATE (:Entity {uuid: 'other', name: 'чужое'})"
+        )
+        return await make_plan(cases(episodes, sanctions), [GROUP], services(), clear_scratch=clear)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(run(False))
+    assert 'main__unmerge_plan' in db.list_graphs()
+    for name in db.list_graphs():
+        db.select_graph(name).delete()
+    plan = asyncio.run(run(True))
+    assert plan['cases'] and 'main__unmerge_plan' not in db.list_graphs()
+
+
+@needs_db
+def test_only_graphs_with_cases_are_copied(db, monkeypatch):
+    from graphiti_core.utils.maintenance import node_operations
+    from tools.unmerge_old_dedupe import make_plan
+
+    seen = []
+    real = node_operations.resolve_extracted_nodes
+
+    async def watch(*args, **kwargs):
+        seen.append(sorted(db.list_graphs()))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(node_operations, 'resolve_extracted_nodes', watch)
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        db.select_graph('other').query("CREATE (:Episodic {uuid: 'x', content: 'ничего общего'})")
+        return await make_plan(cases(episodes, sanctions), [GROUP, 'other'], services())
+
+    asyncio.run(run())
+    assert seen and all('other__unmerge_plan' not in graphs for graphs in seen)
+    assert all('main__unmerge_plan' in graphs for graphs in seen)
