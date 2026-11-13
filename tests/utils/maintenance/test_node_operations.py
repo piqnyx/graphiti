@@ -125,6 +125,7 @@ async def test_resolve_nodes_low_entropy_uses_llm(monkeypatch):
                 'id': 0,
                 'name': 'Joe',
                 'duplicate_candidate_id': -1,
+                'duplicate_candidate_name': '',
             }
         ]
     }
@@ -252,12 +253,14 @@ async def test_resolve_nodes_semantic_miss_keeps_node_without_llm(monkeypatch):
 @pytest.mark.asyncio
 async def test_resolve_nodes_multiple_exact_matches_use_llm(monkeypatch):
     clients, llm_generate = _make_clients()
+    # One entity in the question, so its candidates are numbered from 1 (fork, 13.11).
     llm_generate.return_value = {
         'entity_resolutions': [
             {
                 'id': 0,
                 'name': 'Java',
-                'duplicate_candidate_id': 0,
+                'duplicate_candidate_id': 1,
+                'duplicate_candidate_name': 'Java',
             }
         ]
     }
@@ -285,17 +288,21 @@ async def test_resolve_nodes_multiple_exact_matches_use_llm(monkeypatch):
 @pytest.mark.asyncio
 async def test_resolve_nodes_batches_unresolved_nodes_into_one_llm_call(monkeypatch):
     clients, llm_generate = _make_clients()
+    # Two entities in the question: the shared list Joseph, Java, Java is numbered 2, 3, 4
+    # (fork, 13.11).
     llm_generate.return_value = {
         'entity_resolutions': [
             {
                 'id': 0,
                 'name': 'Joe',
                 'duplicate_candidate_id': -1,
+                'duplicate_candidate_name': '',
             },
             {
                 'id': 1,
                 'name': 'Java',
-                'duplicate_candidate_id': 1,
+                'duplicate_candidate_id': 3,
+                'duplicate_candidate_name': 'Java',
             },
         ]
     }
@@ -502,7 +509,12 @@ async def test_resolve_with_llm_candidate_attributes_cannot_overwrite_candidate_
     llm_client.generate_response = AsyncMock(
         return_value={
             'entity_resolutions': [
-                {'id': 0, 'name': 'Dizzy Gillespie', 'duplicate_candidate_id': 0}
+                {
+                    'id': 0,
+                    'name': 'Dizzy Gillespie',
+                    'duplicate_candidate_id': 1,
+                    'duplicate_candidate_name': 'Dizzy Gillespie',
+                }
             ]
         }
     )
@@ -515,12 +527,15 @@ async def test_resolve_with_llm_candidate_attributes_cannot_overwrite_candidate_
         episode=_make_episode(),
         previous_episodes=[],
         entity_types=None,
+        candidates_by_extracted=[[candidate]],
     )
 
-    # candidate_id must be the positional index (0), not the adversarial attribute (999)
-    assert captured_context['existing_nodes'][0]['candidate_id'] == 0
+    # candidate_id must be the positional number (1: one entity, then the candidate -- fork,
+    # 13.11), not the adversarial attribute (999)
+    shown = captured_context['extracted_nodes'][0]['candidates'][0]
+    assert shown['candidate_id'] == 1
     # non-colliding attributes should still be present
-    assert captured_context['existing_nodes'][0]['genre'] == 'jazz'
+    assert shown['genre'] == 'jazz'
     assert state.resolved_nodes[0].uuid == candidate.uuid
 
 
@@ -549,7 +564,8 @@ async def test_resolve_with_llm_updates_unresolved(monkeypatch):
                 {
                     'id': 0,
                     'name': 'Dizzy Gillespie',
-                    'duplicate_candidate_id': 0,
+                    'duplicate_candidate_id': 1,
+                    'duplicate_candidate_name': 'Dizzy Gillespie',
                 }
             ]
         }
@@ -565,12 +581,14 @@ async def test_resolve_with_llm_updates_unresolved(monkeypatch):
         episode=_make_episode(),
         previous_episodes=[],
         entity_types=None,
+        candidates_by_extracted=[[candidate]],
     )
 
     assert state.resolved_nodes[0].uuid == candidate.uuid
     assert state.uuid_map[extracted.uuid] == candidate.uuid
-    assert isinstance(captured_context['existing_nodes'], list)
-    assert captured_context['existing_nodes'][0]['candidate_id'] == 0
+    # Each entity carries its own candidates, numbered after the entities (fork, 13.11).
+    assert isinstance(captured_context['extracted_nodes'][0]['candidates'], list)
+    assert captured_context['extracted_nodes'][0]['candidates'][0]['candidate_id'] == 1
     assert (
         captured_context['extracted_nodes'][0]['entity_type_description'] == 'Default Entity Type'
     )
@@ -597,7 +615,8 @@ async def test_resolve_with_llm_promotes_generic_candidate_type(monkeypatch):
                 {
                     'id': 0,
                     'name': 'Audrey',
-                    'duplicate_candidate_id': 0,
+                    'duplicate_candidate_id': 1,
+                    'duplicate_candidate_name': 'Audrey',
                 }
             ]
         }
@@ -611,6 +630,7 @@ async def test_resolve_with_llm_promotes_generic_candidate_type(monkeypatch):
         episode=_make_episode(),
         previous_episodes=[],
         entity_types=None,
+        candidates_by_extracted=[[candidate]],
     )
 
     assert state.resolved_nodes[0].uuid == candidate.uuid
@@ -640,6 +660,7 @@ async def test_resolve_with_llm_ignores_out_of_range_relative_ids(monkeypatch, c
                     'id': 5,
                     'name': 'Dexter',
                     'duplicate_candidate_id': -1,
+                    'duplicate_candidate_name': '',
                 }
             ]
         }
@@ -654,6 +675,7 @@ async def test_resolve_with_llm_ignores_out_of_range_relative_ids(monkeypatch, c
             episode=_make_episode(),
             previous_episodes=[],
             entity_types=None,
+            candidates_by_extracted=[[]],
         )
 
     assert state.resolved_nodes[0] is None
@@ -680,12 +702,14 @@ async def test_resolve_with_llm_ignores_duplicate_relative_ids(monkeypatch):
                 {
                     'id': 0,
                     'name': 'Dizzy Gillespie',
-                    'duplicate_candidate_id': 0,
+                    'duplicate_candidate_id': 1,
+                    'duplicate_candidate_name': 'Dizzy Gillespie',
                 },
                 {
                     'id': 0,
                     'name': 'Dizzy',
                     'duplicate_candidate_id': -1,
+                    'duplicate_candidate_name': '',
                 },
             ]
         }
@@ -699,6 +723,7 @@ async def test_resolve_with_llm_ignores_duplicate_relative_ids(monkeypatch):
         episode=_make_episode(),
         previous_episodes=[],
         entity_types=None,
+        candidates_by_extracted=[[candidate]],
     )
 
     assert state.resolved_nodes[0].uuid == candidate.uuid
@@ -726,6 +751,7 @@ async def test_resolve_with_llm_invalid_candidate_id_defaults_to_extracted(monke
                     'id': 0,
                     'name': 'Dexter',
                     'duplicate_candidate_id': 999,
+                    'duplicate_candidate_name': 'Dexter',
                 }
             ]
         }
@@ -739,6 +765,7 @@ async def test_resolve_with_llm_invalid_candidate_id_defaults_to_extracted(monke
         episode=_make_episode(),
         previous_episodes=[],
         entity_types=None,
+        candidates_by_extracted=[[]],
     )
 
     assert state.resolved_nodes[0] == extracted

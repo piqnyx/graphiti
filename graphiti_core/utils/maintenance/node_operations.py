@@ -15,6 +15,8 @@ limitations under the License.
 """
 
 import logging
+import os
+import unicodedata
 from collections.abc import Awaitable, Callable
 from time import time
 from typing import Any
@@ -464,6 +466,64 @@ def _commit_resolution(
     state.duplicate_pairs.extend(duplicate_pairs)
 
 
+_NAME_QUOTES = frozenset(
+    '\'"`\u00b4\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a\u02b9\u02bb\u02bc\u2032\u2033'
+)
+_NAME_DASHES = frozenset('-\u2010\u2011\u2012\u2013\u2014\u2015\u2212')
+
+
+def _same_name(answered: str | None, name: str | None) -> bool:
+    """Whether the name a dedupe answer repeats is the candidate's.
+
+    The check is whether the number and the name agree, so what tells names apart counts --
+    letters, digits and symbols such as "#", "+" and dots ("C#" is not "C++", "iOS 1.7" is not
+    "iOS 17") -- and only what a model changes while copying a name does not: the form of a
+    letter (NFKC: "й" as one code point or as "и" with a combining breve), case (lower, not
+    casefold, which would make "Maße" "Masse"), ё/е, the invisible characters the client
+    strips from the prompt (``LLMClient._clean_input``), quotes and apostrophes of any kind,
+    every kind of dash or minus (one "-", so "Level -1" is still not "Level 1") and spacing
+    (one space). A name that is left with nothing is compared whole.
+    """
+
+    def form(value: str | None) -> str:
+        kept = []
+        for char in unicodedata.normalize('NFKC', value or ''):
+            category = unicodedata.category(char)
+            if category in ('Cf', 'Cs') or (category == 'Cc' and not char.isspace()):
+                continue
+            if char in _NAME_QUOTES:
+                continue
+            kept.append('-' if char in _NAME_DASHES else ' ' if char.isspace() else char)
+        return ' '.join(''.join(kept).lower().replace('ё', 'е').split())
+
+    expected = form(name)
+    if not expected:
+        return (answered or '').strip() == (name or '').strip()
+    return form(answered) == expected
+
+
+def _dedupe_reasks() -> int:
+    """How many times entities whose dedupe answer fails the check are asked again.
+
+    ``GRAPHITI_DEDUPE_REASKS``: unset asks again once; 0 never does, and a failed answer keeps
+    no duplicate at once; anything that is not a whole non-negative number asks again once
+    and says so. Each second question holds only the entities still failing.
+    """
+    raw = os.environ.get('GRAPHITI_DEDUPE_REASKS', '').strip()
+    if not raw:
+        return 1
+    try:
+        count = int(raw)
+    except ValueError:
+        count = -1
+    if count < 0:
+        logger.warning(
+            'GRAPHITI_DEDUPE_REASKS=%r is not a whole non-negative number; asking again once.', raw
+        )
+        return 1
+    return count
+
+
 async def _resolve_with_llm(
     llm_client: LLMClient,
     extracted_nodes: list[EntityNode],
@@ -472,11 +532,23 @@ async def _resolve_with_llm(
     episode: EpisodicNode | None,
     previous_episodes: list[EpisodicNode] | None,
     entity_types: dict[str, type[BaseModel]] | None,
+    *,
+    candidates_by_extracted: list[list[EntityNode]],
 ) -> None:
     """Escalate unresolved nodes to the dedupe prompt so the LLM can select or reject duplicates.
 
     The guardrails below defensively ignore malformed or duplicate LLM responses so the
     ingestion workflow remains deterministic even when the model misbehaves.
+
+    Fork (13.11): each entity is shown with its own candidates -- ``candidates_by_extracted``,
+    aligned with ``extracted_nodes``, the ones its own search found -- and a candidate's number
+    is the entity count plus its place in ``indexes.existing_nodes``, so it never coincides
+    with an entity number. A merge is taken only with a candidate from that entity's own list
+    whose name the answer repeats; the entities whose answer fails that, or that the answer
+    leaves out, are asked again, alone, up to ``GRAPHITI_DEDUPE_REASKS`` times (once when it
+    is unset), each time only those still failing. What fails every question stays a new
+    entity. A duplicate entity costs a later merge; a wrong merge hangs one thing's facts on
+    another.
     """
     if not state.unresolved_indices:
         return
@@ -516,112 +588,208 @@ async def _resolve_with_llm(
                 [ctx['id'] for ctx in extracted_nodes_context[-sample_size:]],
             )
 
-    existing_nodes_context = [
-        {
-            **candidate.attributes,
-            'candidate_id': i,
-            'name': candidate.name,
-            'entity_types': candidate.labels,
-            'summary': candidate.summary[:120] if candidate.summary else '',
-        }
-        for i, candidate in enumerate(indexes.existing_nodes)
-    ]
-
-    # Build candidate_id -> node mapping for resolving duplicates by ID
-    candidates_by_id: dict[int, EntityNode] = {
-        i: node for i, node in enumerate(indexes.existing_nodes)
-    }
-
-    context = {
-        'extracted_nodes': extracted_nodes_context,
-        'existing_nodes': existing_nodes_context,
-        'episode_content': episode.content if episode is not None else '',
-        'previous_episodes': (
-            [
-                {
-                    'content': ep.content,
-                    'timestamp': ep.valid_at.isoformat() if ep.valid_at else None,
-                }
-                for ep in previous_episodes
+    # A candidate's number is the entity count of the first question plus its place in the
+    # shared list -- the same in the first question and in the second, and never an entity's
+    # number. Each entity's own candidates by number are what its answer is checked against.
+    # The node behind a number is the shared list's copy: every search returns its own copy of
+    # a graph node, and two entities merged into one node must land on one copy, as they did.
+    first_count = len(state.unresolved_indices)
+    questions = 1 + _dedupe_reasks()
+    first_relative_id = {original: i for i, original in enumerate(state.unresolved_indices)}
+    place_by_uuid = {node.uuid: i for i, node in enumerate(indexes.existing_nodes)}
+    own_by_number: dict[int, dict[int, EntityNode]] = {
+        original: {
+            first_count + place_by_uuid[candidate.uuid]: indexes.existing_nodes[
+                place_by_uuid[candidate.uuid]
             ]
-            if previous_episodes is not None
-            else []
-        ),
+            for candidate in candidates_by_extracted[original]
+        }
+        for original in state.unresolved_indices
     }
-
-    llm_response = await llm_client.generate_response(
-        prompt_library.dedupe_nodes.nodes(context),
-        response_model=NodeResolutions,
-        prompt_name='dedupe_nodes.nodes',
+    previous_episodes_context = (
+        [
+            {
+                'content': ep.content,
+                'timestamp': ep.valid_at.isoformat() if ep.valid_at else None,
+            }
+            for ep in previous_episodes
+        ]
+        if previous_episodes is not None
+        else []
     )
 
-    node_resolutions: list[NodeDuplicate] = NodeResolutions(**llm_response).entity_resolutions
+    def question(originals: list[int]) -> dict[str, Any]:
+        """The dedupe context for these entities, numbered from zero in this question."""
+        rows = []
+        for relative_id, original in enumerate(originals):
+            row = dict(extracted_nodes_context[first_relative_id[original]])
+            row['id'] = relative_id
+            row['candidates'] = [
+                {
+                    **candidate.attributes,
+                    'candidate_id': number,
+                    'name': candidate.name,
+                    'entity_types': candidate.labels,
+                    'summary': candidate.summary[:120] if candidate.summary else '',
+                }
+                for number, candidate in own_by_number[original].items()
+            ]
+            rows.append(row)
+        return {
+            'extracted_nodes': rows,
+            'episode_content': episode.content if episode is not None else '',
+            'previous_episodes': previous_episodes_context,
+        }
 
-    valid_relative_range = range(len(state.unresolved_indices))
-    processed_relative_ids: set[int] = set()
+    async def ask(messages: list[Any], prompt_name: str) -> list[NodeDuplicate]:
+        """The model's answer to a question already built: the request and its reading."""
+        llm_response = await llm_client.generate_response(
+            messages,
+            response_model=NodeResolutions,
+            prompt_name=prompt_name,
+        )
+        return NodeResolutions(**llm_response).entity_resolutions
 
-    received_ids = {r.id for r in node_resolutions}
-    expected_ids = set(valid_relative_range)
-    missing_ids = expected_ids - received_ids
-    extra_ids = received_ids - expected_ids
+    def settle(
+        originals: list[int], node_resolutions: list[NodeDuplicate], *, last: bool
+    ) -> list[int]:
+        """Apply the answers that pass the check; return the entities to ask about again.
 
-    logger.debug(
-        'Received %d resolutions for %d entities',
-        len(node_resolutions),
-        len(state.unresolved_indices),
-    )
+        On the last question nothing is asked again: an answer that still fails the check
+        leaves its entity with no duplicate, as an invalid candidate id always did.
+        """
+        valid_relative_range = range(len(originals))
+        processed_relative_ids: set[int] = set()
 
-    if missing_ids:
-        logger.warning('LLM did not return resolutions for IDs: %s', sorted(missing_ids))
+        received_ids = {r.id for r in node_resolutions}
+        expected_ids = set(valid_relative_range)
+        missing_ids = expected_ids - received_ids
+        extra_ids = received_ids - expected_ids
 
-    if extra_ids:
-        logger.warning(
-            'LLM returned invalid IDs outside valid range 0-%d: %s (all returned IDs: %s)',
-            len(state.unresolved_indices) - 1,
-            sorted(extra_ids),
-            sorted(received_ids),
+        logger.debug(
+            'Received %d resolutions for %d entities',
+            len(node_resolutions),
+            len(originals),
         )
 
-    for resolution in node_resolutions:
-        relative_id: int = resolution.id
-        duplicate_candidate_id: int = resolution.duplicate_candidate_id
+        if missing_ids:
+            logger.warning('LLM did not return resolutions for IDs: %s', sorted(missing_ids))
 
-        if relative_id not in valid_relative_range:
+        if extra_ids:
             logger.warning(
-                'Skipping invalid LLM dedupe id %d (valid range: 0-%d, received %d resolutions)',
-                relative_id,
-                len(state.unresolved_indices) - 1,
-                len(node_resolutions),
+                'LLM returned invalid IDs outside valid range 0-%d: %s (all returned IDs: %s)',
+                len(originals) - 1,
+                sorted(extra_ids),
+                sorted(received_ids),
             )
-            continue
 
-        if relative_id in processed_relative_ids:
-            logger.warning('Duplicate LLM dedupe id %s received; ignoring.', relative_id)
-            continue
-        processed_relative_ids.add(relative_id)
+        failed: list[int] = []
+        for resolution in node_resolutions:
+            relative_id: int = resolution.id
+            duplicate_candidate_id: int = resolution.duplicate_candidate_id
 
-        original_index = state.unresolved_indices[relative_id]
-        extracted_node = extracted_nodes[original_index]
+            if relative_id not in valid_relative_range:
+                logger.warning(
+                    'Skipping invalid LLM dedupe id %d (valid range: 0-%d, received %d resolutions)',
+                    relative_id,
+                    len(originals) - 1,
+                    len(node_resolutions),
+                )
+                continue
 
-        resolved_node: EntityNode
-        if duplicate_candidate_id < 0:
-            resolved_node = extracted_node
-        elif duplicate_candidate_id in candidates_by_id:
-            resolved_node = _promote_resolved_node(
-                extracted_node, candidates_by_id[duplicate_candidate_id]
-            )
+            if relative_id in processed_relative_ids:
+                logger.warning('Duplicate LLM dedupe id %s received; ignoring.', relative_id)
+                continue
+            processed_relative_ids.add(relative_id)
+
+            original_index = originals[relative_id]
+            extracted_node = extracted_nodes[original_index]
+
+            resolved_node: EntityNode
+            if duplicate_candidate_id < 0:
+                resolved_node = extracted_node
+            else:
+                candidate = own_by_number[original_index].get(duplicate_candidate_id)
+                if candidate is not None and _same_name(
+                    resolution.duplicate_candidate_name, candidate.name
+                ):
+                    resolved_node = _promote_resolved_node(extracted_node, candidate)
+                elif not last:
+                    failed.append(original_index)
+                    continue
+                else:
+                    logger.warning(
+                        'Dedupe answer for %r failed the check on the last question (%d of %d): '
+                        'candidate %d named %r is %s; treating as no duplicate.',
+                        extracted_node.name,
+                        questions,
+                        questions,
+                        duplicate_candidate_id,
+                        resolution.duplicate_candidate_name,
+                        'not one of its own'
+                        if candidate is None
+                        else f'its own, named {candidate.name!r}',
+                    )
+                    resolved_node = extracted_node
+
+            state.resolved_nodes[original_index] = resolved_node
+            state.uuid_map[extracted_node.uuid] = resolved_node.uuid
+            if resolved_node.uuid != extracted_node.uuid:
+                state.duplicate_pairs.append((extracted_node, resolved_node))
+
+        if not last:
+            failed.extend(originals[i] for i in missing_ids)
         else:
-            logger.warning(
-                'Invalid duplicate_candidate_id %d for extracted node %s; treating as no duplicate.',
-                duplicate_candidate_id,
-                extracted_node.uuid,
-            )
-            resolved_node = extracted_node
+            for i in sorted(missing_ids):
+                logger.warning(
+                    'Dedupe answer left out %r on the last question (%d of %d); treating as no '
+                    'duplicate.',
+                    extracted_nodes[originals[i]].name,
+                    questions,
+                    questions,
+                )
+        return sorted(set(failed))
 
-        state.resolved_nodes[original_index] = resolved_node
-        state.uuid_map[extracted_node.uuid] = resolved_node.uuid
-        if resolved_node.uuid != extracted_node.uuid:
-            state.duplicate_pairs.append((extracted_node, resolved_node))
+    again = settle(
+        state.unresolved_indices,
+        await ask(
+            prompt_library.dedupe_nodes.nodes(question(state.unresolved_indices)),
+            'dedupe_nodes.nodes',
+        ),
+        last=questions == 1,
+    )
+    for asked in range(2, questions + 1):
+        if not again:
+            break
+        logger.warning(
+            'Dedupe answer failed the check or left out %d of %d entities (%s); asking again for '
+            'them alone (%d of %d).',
+            len(again),
+            first_count,
+            ', '.join(repr(extracted_nodes[i].name) for i in again),
+            asked - 1,
+            questions - 1,
+        )
+        # Asking again is insurance. When the model's side of it fails -- a refusal, a limit,
+        # a network fault, an answer that does not read -- these entities stay new and the
+        # episode goes on with what was settled before; before the check existed, the episode
+        # would have gone on too. Building the question is our own code and stays outside:
+        # a fault there must surface.
+        messages = prompt_library.dedupe_nodes.nodes(question(again))
+        try:
+            answer = await ask(messages, 'dedupe_nodes.nodes_again')
+        except (TypeError, AttributeError, NameError, AssertionError, KeyError, IndexError):
+            # These signal a bug in our own code -- the client included -- not the model.
+            raise
+        except Exception as error:
+            logger.warning(
+                'Asking again failed (%s: %s); %s kept with no duplicate.',
+                type(error).__name__,
+                error,
+                ', '.join(repr(extracted_nodes[i].name) for i in again),
+            )
+            return
+        again = settle(again, answer, last=asked == questions)
 
 
 async def resolve_extracted_nodes(
@@ -686,6 +854,7 @@ async def resolve_extracted_nodes(
             episode,
             previous_episodes,
             entity_types,
+            candidates_by_extracted=candidate_nodes_by_extracted,
         )
 
     if not state.unresolved_indices and not any(candidate_nodes_by_extracted):
