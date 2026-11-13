@@ -28,17 +28,22 @@ What one undone merge changes, and nothing else:
 Episodes, sagas, NEXT_EPISODE, HAS_EPISODE, fact texts, embeddings and provenance are never touched.
 
 A case is left whole, and reported, when the trace cannot say what extraction gave the entity, when
-its episode or wrong node cannot be found exactly once, or when one of its facts was not created by
-its episode (dedupe folded it into an older fact of the wrong node, which is not the entity's to take
-away). Any other problem in the plan stops apply.
+its episode or wrong node cannot be found exactly once, when one of its facts was not created by its
+episode (dedupe folded it into an older fact of the wrong node, which is not the entity's to take
+away), or when the old run filed the wrong node more than once in the episode and facts are involved
+(several merges into it, or the episode naming it): how many summary lines they left is not known.
+Any other problem in the plan -- removing a node's last mention, a mention without a uuid that would
+have to go -- stops apply.
 
 apply on the graph the plan was made from needs --server-stopped (graphiti-server down: its own
-writes in between would undo a summary edit or duplicate a moved fact) and --backup naming a copy
-that still matches the graph in every node, fact and mention.
+writes in between would undo a summary edit or duplicate a moved fact) and --backup naming another
+graph, a copy that leads to the same graph under the plan (so an interrupted write can be finished).
+After writing, the whole graph must equal the plan laid over the graph before, exactly.
 
-The cases file is made from the Graphiti trace: one entry per merge to undo, with the
-entity, the node it was wrongly merged into, the episode text, the facts extraction
-gave the entity, and whether the episode named the wrong node by itself.
+The cases file is made from the Graphiti trace: one entry per merge to undo, with the entity,
+the node it was wrongly merged into, the episode text, the facts extraction gave the entity by
+name, whether the episode named the wrong node by itself, and how many entities the model's
+answer sent into it.
 
 Run it inside the Graphiti image, with the configuration the server uses:
 
