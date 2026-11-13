@@ -61,7 +61,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 PLAN_VERSION = 1
-SOURCE_GRAPH_CHECKS = ('Episodic', 'Saga', 'NEXT_EPISODE', 'HAS_EPISODE')
 # The server caps a result at RESULTSET_SIZE rows (10000 by default) and says nothing when it does,
 # so every whole-graph read goes in pages and is checked against a count.
 PAGE = 5000
@@ -170,7 +169,11 @@ def all_rows(graph, match: str, returns: str, order: str) -> list[list[Any]]:
 def snapshot(graph, group_id: str) -> dict[str, Any]:
     """Everything apply compares before and after. Read only."""
     snap: dict[str, Any] = {}
-    snap['labels'] = {str(lab): c for lab, c in rows(graph, 'MATCH (n) RETURN labels(n), count(n)')}
+    # Keyed by the sorted labels: a typed node gets its type as a label next to Entity.
+    snap['labels'] = collections.Counter()
+    for lab, c in rows(graph, 'MATCH (n) RETURN labels(n), count(n)'):
+        snap['labels'][str(sorted(lab))] += c
+    snap['labels'] = dict(snap['labels'])
     snap['types'] = {t: c for t, c in rows(graph, 'MATCH ()-[r]->() RETURN type(r), count(r)')}
     # FalkorDB gives no size for a stored vector; its type is what says it is one.
     snap['entities'] = {
@@ -278,7 +281,8 @@ def expected_after(before: dict, ops: dict, group_id: str) -> dict[str, Any]:
     )
     for n in ops['new_nodes']:
         if n['uuid'] not in exp['entities']:
-            exp['labels']["['Entity']"] = exp['labels'].get("['Entity']", 0) + 1
+            key = str(sorted(set(n['labels']) | {'Entity'}))
+            exp['labels'][key] = exp['labels'].get(key, 0) + 1
         exp['entities'][n['uuid']] = {
             'name': n['name'],
             'summary': n['summary'],
@@ -559,6 +563,22 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                 else:
                     fact_ends[c['index']] = found
 
+            # Two merges into one node in one episode: the old run filed that node once per merge,
+            # so its facts went into the summary more than once and how often is not known. Such
+            # merges are left whole when facts are involved.
+            by_wrong = collections.defaultdict(list)
+            for c in group_cases:
+                if not c.get('skipped'):
+                    by_wrong[c['wrong_uuid']].append(c)
+            for crowd in by_wrong.values():
+                if len(crowd) > 1 and any(fact_ends.get(c['index']) for c in crowd):
+                    for c in crowd:
+                        problem(
+                            c,
+                            'two or more merges into one node in one episode, with facts: '
+                            'how many summary lines they left there is not known',
+                        )
+                        c['skipped'] = True
             active = [c for c in group_cases if not c.get('skipped')]
             extracted = [
                 EntityNode(
@@ -647,14 +667,9 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                             'episodes': next(r[5] for r in on_episode if r[0] == edge_uuid),
                         },
                     )
+                    # An end lies on exactly one wrong node, and two merges into one wrong node with
+                    # facts are left whole above, so no two entities can claim the same end here.
                     side = 'new_source' if role == 'source' else 'new_target'
-                    if move[side] != move['old_' + side[4:]]:
-                        problem(
-                            c,
-                            f'two entities claim the same end of a fact: {move["fact"][:120]}',
-                            False,
-                        )
-                        continue
                     move[side] = t.uuid
 
             moved_here = [
@@ -739,6 +754,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                 # line when the fact was made. A loop made by the move gains its node one end, not two.
                 moved_edges = []
                 target_ids = {t.uuid for t in unique_targets}
+                gained_here: set[str] = set()
                 for m in moved_here:
                     gained = ends(m['new_source'], m['new_target']) - ends(
                         m['old_source'], m['old_target']
@@ -748,6 +764,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     edge = await EntityEdge.get_by_uuid(driver, m['uuid'])
                     for node, count in gained.items():
                         if node in target_ids:
+                            gained_here.add(node)
                             moved_edges += [
                                 edge.model_copy(
                                     update={
@@ -774,6 +791,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     entry.setdefault('target_before', before_summary[t.uuid])
                     entry['target_after'] = t.summary
                     entry['name'] = t.name
+                    entry['gained'] = entry.get('gained') or t.uuid in gained_here
 
             for c in changing:
                 entry = summaries.get((graph, c['wrong_uuid']))
@@ -826,10 +844,22 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     'node_name': entry.get('name'),
                     'before': entry['target_before'],
                     'after': entry['target_after'],
-                    'why': 'facts that moved here',
+                    'why': 'facts that moved here'
+                    if entry.get('gained')
+                    else 'summary as add_episode would write it',
                 }
             )
 
+    # Nodes already named like a new one: shown to the eye, and not taken by apply for ones that
+    # appeared since. Graphiti's exact match leaves such a name to the model when it is not unique.
+    names_by_graph: dict[str, dict[str, list[str]]] = {}
+    for graph in {g for g, _ in planned_new}:
+        names = collections.defaultdict(list)
+        for u, n in all_rows(
+            db.select_graph(graph), 'MATCH (n:Entity)', 'n.uuid, n.name', 'n.uuid'
+        ):
+            names[norm(n)].append(u)
+        names_by_graph[graph] = names
     for (graph, _), node in planned_new.items():
         if node.name_embedding is None:
             await node.generate_name_embedding(services['embedder'])
@@ -844,6 +874,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                 'summary': node.summary,
                 'attributes': dict(node.attributes or {}),
                 'name_embedding': list(node.name_embedding),
+                'namesakes': sorted(names_by_graph[graph].get(norm(node.name), [])),
             }
         )
     return plan
@@ -885,6 +916,8 @@ def report(plan: dict) -> str:
         out.append('    after:  ' + e['after'].replace('\n', ' / '))
     for n in plan['new_nodes']:
         out.append(f'  new node {n["name"]!r}: {n["summary"][:200]!r}')
+        if n.get('namesakes'):
+            out.append(f'    namesakes already in the graph: {n["namesakes"]}')
     for p in plan['problems']:
         out.append(f'  PROBLEM {p}')
     return '\n'.join(out)
@@ -905,7 +938,7 @@ def preflight(g, ops: dict) -> list[str]:
         got = rows(g, 'MATCH (n:Entity {uuid: $u}) RETURN n.name', u=n['uuid'])
         if got and got[0][0] != n['name']:
             bad.append(f'node {n["uuid"]} exists under another name')
-        others = names.get(norm(n['name']), set()) - {n['uuid']}
+        others = names.get(norm(n['name']), set()) - {n['uuid']} - set(n.get('namesakes') or [])
         if others:
             bad.append(f'a node named {n["name"]!r} appeared since the plan: {sorted(others)}')
     planned = {n['uuid'] for n in ops['new_nodes']}

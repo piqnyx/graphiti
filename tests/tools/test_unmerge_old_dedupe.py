@@ -497,6 +497,7 @@ def cases(episodes, sanctions):
             'entity': 'Канада',
             'wrong': 'Deutsche Welle',
             'episode_content': text('e2'),
+            'entity_labels': ['Entity', 'Organization'],
             'entity_facts': [
                 {'source': 'Канада', 'target': x, 'fact': sanctions}
                 for x in ('Яндекс', 'Ozon', 'Wildberries')
@@ -664,8 +665,6 @@ def test_plan_sends_each_entity_where_the_new_dedupe_puts_it(db):
         'Пентагон',
         'Swift',
         'Шойгу',
-        'Мишустин',
-        'Набиуллина',
         'Чемезов',
         'Gmail Inc',
         'Росгвардия',
@@ -674,6 +673,8 @@ def test_plan_sends_each_entity_where_the_new_dedupe_puts_it(db):
     assert all(isinstance(n['attributes'], dict) for n in plan['new_nodes'])
     assert sorted(p['entity'] for p in plan['problems'] if 'entity' in p) == [
         'Луганск',
+        'Мишустин',
+        'Набиуллина',
         'Нет такого',
         'Неясно',
         'Повтор',
@@ -987,20 +988,22 @@ def test_a_loop_left_by_the_old_merge_keeps_the_wrong_node_as_its_other_end(db):
 
 
 @needs_db
-def test_two_entities_merged_into_one_node_each_get_their_own_end(db):
-    plan, _, made, _ = asyncio.run(made_plan())
+def test_two_merges_into_one_node_with_facts_are_left_whole(db):
+    # The old run filed that node twice, so its facts went into its summary twice; how often is not
+    # known for sure, so neither merge is undone and both are reported.
+    plan, episodes, made, _ = asyncio.run(made_plan())
     c = by_entity(plan)
-    mishustin = c[('Мишустин', 'Минфин')]['target_uuid']
-    nabiullina = c[('Набиуллина', 'Минфин')]['target_uuid']
-    assert mishustin != nabiullina
-    (order,) = by_fact(plan, 'Мишустин поручил Набиуллиной')
-    assert (order['new_source'], order['new_target']) == (mishustin, nabiullina)
-    (ozon,) = by_fact(plan, 'Мишустин упомянул Ozon')
-    assert (ozon['new_source'], ozon['new_target']) == (mishustin, made['Ozon'].uuid)
-    edits = {e['node_uuid']: e for e in plan['summary_edits']}
-    assert edits[made['Минфин'].uuid]['after'] == 'Министерство.'
-    dropped = [m for m in plan['mentions_drop'] if m['entity'] == made['Минфин'].uuid]
-    assert len(dropped) == 2
+    assert c[('Мишустин', 'Минфин')]['decision'] == 'skipped'
+    assert c[('Набиуллина', 'Минфин')]['decision'] == 'skipped'
+    whys = [p for p in plan['problems'] if p.get('entity') in ('Мишустин', 'Набиуллина')]
+    assert len(whys) == 2 and all(
+        p['skipped'] and 'one node in one episode' in p['why'] for p in whys
+    )
+    assert not by_fact(plan, 'Мишустин поручил Набиуллиной')
+    assert not by_fact(plan, 'Мишустин упомянул Ozon')
+    assert made['Минфин'].uuid not in {e['node_uuid'] for e in plan['summary_edits']}
+    e13 = episodes['e13'].uuid
+    assert not [m for m in plan['mentions_drop'] + plan['mentions_add'] if m['episode'] == e13]
 
 
 @needs_db
@@ -1041,7 +1044,12 @@ def test_the_whole_plan_applies_on_a_copy_with_the_new_cases(db, capsys):
     assert code == 0, capsys.readouterr().out
     g = db.select_graph('main_copy')
     got = g.ro_query('MATCH (n:Entity {uuid: $u}) RETURN n.summary', {'u': made['Минфин'].uuid})
-    assert got.result_set == [['Министерство.']]
+    assert got.result_set == [[made['Минфин'].summary]]
+    kanada = by_entity(plan)[('Канада', 'Deutsche Welle')]['target_uuid']
+    labels = g.ro_query('MATCH (n:Entity {uuid: $u}) RETURN labels(n)', {'u': kanada}).result_set[
+        0
+    ][0]
+    assert sorted(labels) == ['Entity', 'Organization']
 
 
 @needs_db
@@ -1124,29 +1132,6 @@ def test_apply_refuses_a_backup_that_differs_in_content_not_in_counts(db, capsys
         apply(json.loads(json.dumps(plan)), GROUP, GROUP, 'main_backup', server_stopped=True)
     )
     assert code == 2
-
-
-@needs_db
-def test_two_entities_claiming_one_end_of_a_fact_stop_apply(db, capsys):
-    from tools.unmerge_old_dedupe import apply, make_plan
-
-    async def run():
-        driver, episodes, made, sanctions = await seed()
-        both = [c for c in cases(episodes, sanctions) if c['wrong'] == 'Минфин']
-        # An inconsistent trace: Набиуллина also named as the source of Мишустин's fact.
-        both[1] = dict(
-            both[1],
-            entity_facts=[
-                {'source': 'Набиуллина', 'target': 'Ozon', 'fact': 'Мишустин упомянул Ozon'}
-            ],
-        )
-        return await make_plan(both, [GROUP], services())
-
-    plan = asyncio.run(run())
-    claimed = [p for p in plan['problems'] if 'claim the same end' in p['why']]
-    assert claimed and not claimed[0]['skipped']
-    copy_graph(db, GROUP, 'main_copy')
-    assert asyncio.run(apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 2
 
 
 @needs_db
@@ -1379,3 +1364,32 @@ def test_a_mention_without_uuid_is_the_one_kept_when_one_of_two_goes(db):
     assert not [p for p in plan['problems'] if 'without a uuid' in p['why']]
     dropped = [m for m in plan['mentions_drop'] if m['episode'] == e15]
     assert len(dropped) == 1 and dropped[0]['uuid'] is not None
+
+
+@needs_db
+def test_namesakes_already_there_at_plan_time_do_not_stop_apply(db, capsys):
+    from tools.unmerge_old_dedupe import apply, make_plan, report
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        # Two nodes named like Пентагон before the plan: Graphiti's exact match cannot pick one,
+        # and the model says neither, so the plan creates a third.
+        await driver.execute_query(
+            "CREATE (:Entity {uuid: 'p1', name: 'Пентагон', group_id: 'main', summary: '', labels: ['Entity']}), "
+            "(:Entity {uuid: 'p2', name: 'Пентагон', group_id: 'main', summary: '', labels: ['Entity']})"
+        )
+        return await make_plan(cases(episodes, sanctions), [GROUP], services())
+
+    plan = asyncio.run(run())
+    new = {n['name']: n for n in plan['new_nodes']}
+    assert new['Пентагон']['namesakes'] == ['p1', 'p2']
+    assert 'namesakes' in report(plan)
+    copy_graph(db, GROUP, 'main_copy')
+    assert asyncio.run(apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 0
+
+
+@needs_db
+def test_a_summary_rewritten_without_moved_facts_says_so(db):
+    plan, _, made, _ = asyncio.run(made_plan())
+    edits = {e['node_uuid']: e for e in plan['summary_edits']}
+    assert edits[made['Прага'].uuid]['why'] == 'summary as add_episode would write it'
