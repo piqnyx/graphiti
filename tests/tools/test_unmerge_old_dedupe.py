@@ -139,7 +139,14 @@ AXES: dict[str, int] = {}
 
 def vector(name: str) -> list[float]:
     """Each name its own axis; names meant to be dedupe candidates of one another share it."""
-    shared = {'BBC News': 'BBC', 'Канада': 'Канада', 'Swift': 'Swift', 'Google Mail': 'Gmail'}
+    shared = {
+        'BBC News': 'BBC',
+        'Канада': 'Канада',
+        'Swift': 'Swift',
+        'Google Mail': 'Gmail',
+        'Prague': 'Прага',
+        'Brno': 'Брно',
+    }
     key = shared.get(name, name)
     axis = AXES.setdefault(key, len(AXES) % DIM)
     v = [0.0] * DIM
@@ -207,7 +214,10 @@ class LLM(LLMClient):
 
 def services(choices=None):
     return {
-        'llm': LLM(choices or {'BBC News': 'BBC', 'Google Mail': 'Gmail'}),
+        'llm': LLM(
+            choices
+            or {'BBC News': 'BBC', 'Google Mail': 'Gmail', 'Prague': 'Прага', 'Brno': 'Брно'}
+        ),
         'embedder': Embedder(),
         'cross_encoder': CrossEncoder(),
         'entity_types': None,
@@ -252,7 +262,7 @@ async def seed():
             source=EpisodeType.json,
             source_description='chat',
             content=json.dumps({'messages': [{'text': text}]}, ensure_ascii=False),
-            created_at=T0 + timedelta(minutes=minutes),
+            created_at=T0 + timedelta(minutes=minutes, seconds=7),
             valid_at=T0 + timedelta(minutes=minutes),
         )
         episodes[key] = ep
@@ -323,6 +333,8 @@ async def seed():
             'Киев',
             'Оксфорд',
             'Gmail',
+            'Прага',
+            'Брно',
         ],
         facts=[('Чернобыльская АЭС', 'Киев', 'Чернобыльская АЭС находится рядом с Киевом')],
         summaries={
@@ -367,6 +379,11 @@ async def seed():
     )
     # Google Mail into Gmail: an old merge the new dedupe makes too.
     await episode('e8', 80, 'Google Mail', ['Gmail'])
+    # Prague into Брно and Brno into Прага in one episode: each wrong node is the other's twin.
+    await episode('e9', 90, 'Prague и Brno', ['Брно', 'Прага'])
+    # Two episodes with the same text: neither can be told apart from the other.
+    await episode('e10', 100, 'повтор', ['ViT'])
+    await episode('e11', 110, 'повтор', ['ViT'])
     return driver, episodes, made, sanctions
 
 
@@ -429,6 +446,9 @@ def cases(episodes, sanctions):
             'episode_content': text('e8'),
             'entity_facts': [],
         },
+        {'entity': 'Prague', 'wrong': 'Брно', 'episode_content': text('e9'), 'entity_facts': []},
+        {'entity': 'Brno', 'wrong': 'Прага', 'episode_content': text('e9'), 'entity_facts': []},
+        {'entity': 'Повтор', 'wrong': 'ViT', 'episode_content': text('e10'), 'entity_facts': []},
     ]
 
 
@@ -458,7 +478,13 @@ def test_plan_sends_each_entity_where_the_new_dedupe_puts_it(db):
     assert (first['decision'], second['decision']) == ('new', 'new_planned_earlier')
     assert first['target_uuid'] == second['target_uuid']
     assert {n['name'] for n in plan['new_nodes']} == {'ВСУ', 'Канада', 'Пентагон', 'Swift'}
-    assert [p['entity'] for p in plan['problems'] if 'entity' in p] == ['Нет такого']
+    assert sorted(p['entity'] for p in plan['problems'] if 'entity' in p) == [
+        'Нет такого',
+        'Повтор',
+    ]
+    assert [p['why'] for p in plan['problems'] if p.get('entity') == 'Повтор'] == [
+        '2 episodes carry this text'
+    ]
 
 
 @needs_db
@@ -670,3 +696,63 @@ def test_a_node_gaining_facts_in_two_episodes_keeps_both(db):
     assert yandex['before'] == ''
     assert yandex['after'].split('\n') == [sanctions, 'Яндекс купил долю Ozon']
     assert edits[made['Оксфорд'].uuid]['after'] == 'Университет.'
+
+
+def test_compare_names_a_mention_the_plan_did_not_add():
+    after = snap()
+    after['mentions'] = dict(
+        after['mentions'],
+        x={'episode': 'e', 'entity': 'z', 'from_episodic': True, 'to_entity': True},
+    )
+    assert any('mentions' in p for p in compare(snap(), after, NO_OPS))
+
+
+@needs_db
+def test_wrong_nodes_that_are_each_others_twin_keep_their_mentions(db):
+    plan, episodes, made, _ = asyncio.run(made_plan())
+    c = by_entity(plan)
+    assert c[('Prague', 'Брно')]['target_uuid'] == made['Прага'].uuid
+    assert c[('Brno', 'Прага')]['target_uuid'] == made['Брно'].uuid
+    e9 = episodes['e9'].uuid
+    assert not [m for m in plan['mentions_drop'] if m['episode'] == e9]
+    assert not [m for m in plan['mentions_add'] if m['episode'] == e9]
+
+
+@needs_db
+def test_a_new_node_is_dated_by_its_episode(db):
+    plan, episodes, _, _ = asyncio.run(made_plan())
+    new = next(n for n in plan['new_nodes'] if n['name'] == 'Пентагон')
+    assert new['created_at'] == episodes['e1'].created_at.isoformat()
+
+
+@needs_db
+def test_snapshot_counts_a_fact_whose_recorded_ends_disagree(db):
+    from tools.unmerge_old_dedupe import snapshot
+
+    g = db.select_graph('probe')
+    g.query(
+        "CREATE (:Entity {uuid: 'a'})-[:RELATES_TO {uuid: 'r', source_node_uuid: 'a', "
+        "target_node_uuid: 'x', episodes: ['e']}]->(:Entity {uuid: 'b'})"
+    )
+    assert snapshot(g, 'probe')['checks']['edge_endpoint_props_disagree'] == 1
+
+
+@needs_db
+def test_apply_fails_when_a_second_pass_still_writes(db, capsys, monkeypatch):
+    import collections
+
+    import tools.unmerge_old_dedupe as tool
+
+    plan, _, _, _ = asyncio.run(made_plan())
+    copy_graph(db, GROUP, 'main_copy')
+    real = tool.write
+    passes = []
+
+    async def flaky(conn, graph, ops):
+        done = await real(conn, graph, ops)
+        passes.append(1)
+        return done if len(passes) == 1 else collections.Counter({'facts moved': 1})
+
+    monkeypatch.setattr(tool, 'write', flaky)
+    assert asyncio.run(tool.apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 4
+    assert 'SECOND PASS WROTE' in capsys.readouterr().out

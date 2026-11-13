@@ -570,9 +570,8 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
         for t in existing:
             earlier = summaries.get((graph, t.uuid), {})
             if 'target_after' in earlier:
-                t.summary = earlier[
-                    'target_after'
-                ]  # this node already gains facts from an earlier episode
+                # This node already gains facts from an earlier episode.
+                t.summary = earlier['target_after']
         before = {t.uuid: t.summary for t in unique_targets}
         if unique_targets:
             # One pass for the episode, as add_episode makes it: Graphiti appends short facts itself
