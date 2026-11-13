@@ -51,7 +51,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import copy
 import json
+import logging
 import os
 import sys
 import uuid as uuidlib
@@ -63,6 +65,9 @@ SOURCE_GRAPH_CHECKS = ('Episodic', 'Saga', 'NEXT_EPISODE', 'HAS_EPISODE')
 # The server caps a result at RESULTSET_SIZE rows (10000 by default) and says nothing when it does,
 # so every whole-graph read goes in pages and is checked against a count.
 PAGE = 5000
+# Graphiti appends a node's new facts to its summary through the edges it is handed; an edge whose other
+# end is this placeholder counts for one node only, which is how a gained end is handed over exactly.
+NO_NODE = '__unmerge_no_node__'
 
 
 # ---------------------------------------------------------------- pure helpers
@@ -91,6 +96,17 @@ def remove_fact_lines(summary: str | None, facts: list[str]) -> tuple[str, list[
         else:
             missing.append(fact)
     return '\n'.join(lines).strip(), missing
+
+
+class _Collect(logging.Handler):
+    """Keeps the warnings Graphiti's dedupe logs, so a decision taken after a failed check shows."""
+
+    def __init__(self, into: list[str]):
+        super().__init__(logging.WARNING)
+        self.into = into
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.into.append(record.getMessage())
 
 
 def now_iso() -> str:
@@ -158,7 +174,7 @@ def snapshot(graph, group_id: str) -> dict[str, Any]:
     snap['types'] = {t: c for t, c in rows(graph, 'MATCH ()-[r]->() RETURN type(r), count(r)')}
     # FalkorDB gives no size for a stored vector; its type is what says it is one.
     snap['entities'] = {
-        u: {'name': n, 'summary': s, 'group_id': g, 'labels': lab, 'embedding': t}
+        u: {'name': n, 'summary': s, 'group_id': g, 'labels': sorted(lab or []), 'embedding': t}
         for u, n, s, g, lab, t in all_rows(
             graph,
             'MATCH (n:Entity)',
@@ -189,47 +205,58 @@ def snapshot(graph, group_id: str) -> dict[str, Any]:
             'r.uuid',
         )
     }
+    # A mention written without a uuid (the fork's merge tool MERGEs them so) is keyed by its id.
     snap['mentions'] = {
-        u: {'episode': e, 'entity': n, 'from_episodic': fe, 'to_entity': te}
-        for u, e, n, fe, te in all_rows(
+        (u if u is not None else f'id:{i}'): {
+            'episode': e,
+            'entity': n,
+            'from_episodic': fe,
+            'to_entity': te,
+            'has_uuid': u is not None,
+        }
+        for u, i, e, n, fe, te in all_rows(
             graph,
             'MATCH (a)-[m:MENTIONS]->(b)',
-            "m.uuid, a.uuid, b.uuid, 'Episodic' IN labels(a), 'Entity' IN labels(b)",
-            'm.uuid',
+            "m.uuid, id(m), a.uuid, b.uuid, 'Episodic' IN labels(a), 'Entity' IN labels(b)",
+            'id(m)',
         )
     }
-    episodes = {u for (u,) in all_rows(graph, 'MATCH (e:Episodic)', 'e.uuid', 'e.uuid')}
-    mentioned = collections.Counter(m['entity'] for m in snap['mentions'].values())
-    snap['checks'] = {
+    snap['episodes'] = sorted(
+        u for (u,) in all_rows(graph, 'MATCH (e:Episodic)', 'e.uuid', 'e.uuid')
+    )
+    snap['checks'] = checks_of(snap, group_id)
+    return snap
+
+
+def checks_of(snap: dict, group_id: str) -> dict[str, Any]:
+    """Integrity counters of a snapshot, real or expected."""
+    episodes = set(snap['episodes'])
+    edges, entities, mentions = snap['edges'].values(), snap['entities'], snap['mentions'].values()
+    mentioned = collections.Counter(m['entity'] for m in mentions)
+    return {
         'edge_endpoint_props_disagree': sum(
-            1
-            for e in snap['edges'].values()
-            if e['source_prop'] != e['source'] or e['target_prop'] != e['target']
+            1 for e in edges if e['source_prop'] != e['source'] or e['target_prop'] != e['target']
         ),
         'edge_episode_missing': sum(
-            1 for e in snap['edges'].values() for x in (e['episodes'] or []) if x not in episodes
+            1 for e in edges for x in (e['episodes'] or []) if x not in episodes
         ),
-        'edge_without_episodes': sum(1 for e in snap['edges'].values() if not e['episodes']),
-        'edge_embedding_types': sorted({str(e['has_embedding']) for e in snap['edges'].values()}),
-        'edge_self_loop': sum(1 for e in snap['edges'].values() if e['source'] == e['target']),
-        'edge_group_other': sum(1 for e in snap['edges'].values() if e['group_id'] != group_id),
-        'entity_without_mention': sum(1 for u in snap['entities'] if not mentioned[u]),
-        'entity_embedding_types': sorted({str(e['embedding']) for e in snap['entities'].values()}),
-        'entity_group_other': sum(
-            1 for e in snap['entities'].values() if e['group_id'] != group_id
-        ),
+        'edge_without_episodes': sum(1 for e in edges if not e['episodes']),
+        'edge_embedding_types': sorted({str(e['has_embedding']) for e in edges}),
+        'edge_self_loop': sum(1 for e in edges if e['source'] == e['target']),
+        'edge_group_other': sum(1 for e in edges if e['group_id'] != group_id),
+        'entity_without_mention': sum(1 for u in entities if not mentioned[u]),
+        'entity_embedding_types': sorted({str(e['embedding']) for e in entities.values()}),
+        'entity_group_other': sum(1 for e in entities.values() if e['group_id'] != group_id),
         'mention_not_episode_to_entity': sum(
-            1 for m in snap['mentions'].values() if not (m['from_episodic'] and m['to_entity'])
+            1 for m in mentions if not (m['from_episodic'] and m['to_entity'])
         ),
+        'mention_without_uuid': sum(1 for m in mentions if not m['has_uuid']),
         'mention_duplicate_pair': sum(
             c - 1
-            for c in collections.Counter(
-                (m['episode'], m['entity']) for m in snap['mentions'].values()
-            ).values()
+            for c in collections.Counter((m['episode'], m['entity']) for m in mentions).values()
             if c > 1
         ),
     }
-    return snap
 
 
 def embedding_sizes(graph, uuids: list[str]) -> dict[str, int]:
@@ -237,78 +264,71 @@ def embedding_sizes(graph, uuids: list[str]) -> dict[str, int]:
     return {
         u: len(v or [])
         for u, v in rows(
-            graph, 'MATCH (n:Entity) WHERE n.uuid IN $u RETURN n.uuid, n.name_embedding', u=uuids
+            graph,
+            'MATCH (n:Entity) WHERE n.uuid IN $u RETURN n.uuid, n.name_embedding',
+            u=uuids,
         )
     }
 
 
-def compare(before: dict, after: dict, plan_ops: dict) -> list[str]:
-    """Every difference between two snapshots that the plan does not account for."""
+def expected_after(before: dict, ops: dict, group_id: str) -> dict[str, Any]:
+    """The snapshot the plan leads to from `before`: every step laid over it, done or not yet."""
+    exp = copy.deepcopy(
+        {k: before[k] for k in ('labels', 'types', 'entities', 'edges', 'mentions', 'episodes')}
+    )
+    for n in ops['new_nodes']:
+        if n['uuid'] not in exp['entities']:
+            exp['labels']["['Entity']"] = exp['labels'].get("['Entity']", 0) + 1
+        exp['entities'][n['uuid']] = {
+            'name': n['name'],
+            'summary': n['summary'],
+            'group_id': n['group_id'],
+            'labels': sorted(set(n['labels']) | {'Entity'}),
+            'embedding': 'Vectorf32',
+        }
+    for m in ops['mentions_add']:
+        if m['uuid'] not in exp['mentions']:
+            exp['types']['MENTIONS'] = exp['types'].get('MENTIONS', 0) + 1
+        exp['mentions'][m['uuid']] = {
+            'episode': m['episode'],
+            'entity': m['entity'],
+            'from_episodic': True,
+            'to_entity': True,
+            'has_uuid': True,
+        }
+    for m in ops['mentions_drop']:
+        if exp['mentions'].pop(m['uuid'], None) is not None:
+            exp['types']['MENTIONS'] -= 1
+    for mv in ops['edge_moves']:
+        e = exp['edges'].get(mv['uuid'])
+        if e is None:
+            continue
+        if (e['source'], e['target']) == (mv['old_source'], mv['old_target']):
+            # Only the end that moves has its recorded uuid rewritten.
+            if mv['new_source'] != mv['old_source']:
+                e['source_prop'] = mv['new_source']
+            if mv['new_target'] != mv['old_target']:
+                e['target_prop'] = mv['new_target']
+            e['source'], e['target'] = mv['new_source'], mv['new_target']
+    for s in ops['summary_edits']:
+        if s['node_uuid'] in exp['entities']:
+            exp['entities'][s['node_uuid']]['summary'] = s['after']
+    exp['checks'] = checks_of(exp, group_id)
+    return exp
+
+
+def compare(before: dict, after: dict, ops: dict, group_id: str) -> list[str]:
+    """Every way the graph after differs from what the plan leads to from the graph before."""
+    exp = expected_after(before, ops, group_id)
     bad: list[str] = []
-    new_nodes = {n['uuid'] for n in plan_ops['new_nodes']}
-    edits = {e['node_uuid']: e['after'] for e in plan_ops['summary_edits']}
-    moves = {m['uuid']: m for m in plan_ops['edge_moves']}
-    added = {m['uuid'] for m in plan_ops['mentions_add']}
-    dropped = {m['uuid'] for m in plan_ops['mentions_drop']}
-
-    for key in SOURCE_GRAPH_CHECKS:
-        b = before['labels'].get(f"['{key}']", before['types'].get(key, 0))
-        a = after['labels'].get(f"['{key}']", after['types'].get(key, 0))
-        if a != b:
-            bad.append(f'{key}: {b} before, {a} after')
-
-    if set(after['entities']) != set(before['entities']) | new_nodes:
-        extra = set(after['entities']) - set(before['entities']) - new_nodes
-        lost = set(before['entities']) - set(after['entities'])
-        bad.append(f'entities: unexpected {sorted(extra)[:5]}, lost {sorted(lost)[:5]}')
-    for u, b in before['entities'].items():
-        a = after['entities'].get(u)
-        if a is None:
-            continue
-        want = dict(b, summary=edits.get(u, b['summary']))
-        if a != want:
-            bad.append(f'entity {u} ({b["name"]}) changed beyond the plan')
-    for u in new_nodes:
-        if u not in after['entities']:
-            bad.append(f'new entity {u} missing')
-
-    if set(after['edges']) != set(before['edges']):
-        bad.append('the set of facts changed')
-    for u, b in before['edges'].items():
-        a = after['edges'].get(u)
-        if a is None:
-            continue
-        want = dict(b)
-        if u in moves:
-            m = moves[u]
-            want.update(
-                source=m['new_source'],
-                target=m['new_target'],
-                source_prop=m['new_source'],
-                target_prop=m['new_target'],
-            )
-        if a != want:
-            bad.append(f'fact {u} changed beyond the plan')
-
-    want_mentions = (set(before['mentions']) - dropped) | added
-    if set(after['mentions']) != want_mentions:
-        bad.append(
-            f'mentions: unexpected {sorted(set(after["mentions"]) - want_mentions)[:5]}, '
-            f'missing {sorted(want_mentions - set(after["mentions"]))[:5]}'
-        )
-    for u, b in before['mentions'].items():
-        if u in after['mentions'] and after['mentions'][u] != b:
-            bad.append(f'mention {u} changed')
-
-    for key, b in before['checks'].items():
-        a = after['checks'][key]
-        if key in ('entity_without_mention', 'mention_duplicate_pair', 'edge_self_loop'):
-            # Fewer is the repair working: an undone merge leaves no orphan, no doubled mention and
-            # no loop. Each moved fact's ends are checked one by one above, so a drop is accounted for.
-            if a > b:
-                bad.append(f'{key}: {b} before, {a} after')
-        elif a != b:
-            bad.append(f'{key}: {b} before, {a} after')
+    for key in ('labels', 'types', 'episodes', 'checks'):
+        if exp[key] != after[key]:
+            bad.append(f'{key}: expected {exp[key]}, found {after[key]}')
+    for key, what in (('entities', 'entity'), ('edges', 'fact'), ('mentions', 'mention')):
+        want, got = exp[key], after[key]
+        for u in sorted(set(want) | set(got)):
+            if want.get(u) != got.get(u):
+                bad.append(f'{what} {u}: expected {want.get(u)}, found {got.get(u)}')
     return bad
 
 
@@ -335,7 +355,8 @@ def locate(db, graphs: list[str], case: dict) -> tuple[str, str, str, str] | str
     graph, episode = found[0]
     wrong = rows(
         db.select_graph(graph),
-        'MATCH (e:Episodic {uuid: $e})-[:MENTIONS]->(n:Entity) WHERE n.name = $w RETURN n.uuid, n.summary',
+        'MATCH (e:Episodic {uuid: $e})-[:MENTIONS]->(n:Entity) WHERE n.name = $w '
+        'RETURN DISTINCT n.uuid, n.summary',
         e=episode,
         w=case['wrong'],
     )
@@ -375,6 +396,11 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
 
     config, conn = config_and_connection()
     db = falkor(conn)
+    present = set(db.list_graphs())
+    missing = [name for name in graphs if name not in present]
+    graphs = [name for name in graphs if name in present]
+    if not graphs:
+        raise SystemExit(f'none of the graphs exists: {missing}')
     if services is None:
         from services.factories import CrossEncoderFactory, EmbedderFactory, LLMClientFactory
         from utils.type_config import build_entity_types
@@ -399,6 +425,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
         'version': PLAN_VERSION,
         'made_at': now_iso(),
         'graphs': graphs,
+        'missing_graphs': missing,
         'cases': [],
         'new_nodes': [],
         'mentions_add': [],
@@ -498,7 +525,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
             on_episode = rows(
                 g,
                 'MATCH (a)-[r:RELATES_TO]->(b) WHERE $e IN r.episodes '
-                'RETURN r.uuid, r.fact, a.uuid, b.uuid, r.episodes[0] = $e',
+                'RETURN r.uuid, r.fact, a.uuid, b.uuid, r.episodes[0] = $e, size(r.episodes)',
                 e=episode_uuid,
             )
             for c in group_cases:
@@ -544,10 +571,17 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                 for c in active
             ]
             resolved = []
+            caught: list[str] = []
             if extracted:
-                resolved, _, _ = await resolve_extracted_nodes(
-                    clients, extracted, episode, previous, services['entity_types']
-                )
+                node_log = logging.getLogger('graphiti_core.utils.maintenance.node_operations')
+                handler = _Collect(caught)
+                node_log.addHandler(handler)
+                try:
+                    resolved, _, _ = await resolve_extracted_nodes(
+                        clients, extracted, episode, previous, services['entity_types']
+                    )
+                finally:
+                    node_log.removeHandler(handler)
 
             for c in group_cases:
                 if c.get('skipped'):
@@ -572,6 +606,10 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     'wrong': c['wrong'],
                     'wrong_uuid': c['wrong_uuid'],
                 }
+                warned = [w for w in caught if repr(c['entity']) in w]
+                if warned:
+                    # A failed check or a failed second question also ends as "no duplicate".
+                    record['dedupe_warning'] = ' | '.join(warned)
                 if t.uuid == c['wrong_uuid']:
                     record.update(decision='same_as_before', target_uuid=t.uuid, target_name=t.name)
                     plan['cases'].append(record)
@@ -606,6 +644,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                             'old_target': b,
                             'new_source': a,
                             'new_target': b,
+                            'episodes': next(r[5] for r in on_episode if r[0] == edge_uuid),
                         },
                     )
                     side = 'new_source' if role == 'source' else 'new_target'
@@ -672,9 +711,16 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     )
                     else 0
                 )
-                have = sorted(mentions.get(wrong, []))
+                # Mentions without a uuid come first, so the ones kept are those if any.
+                have = sorted(mentions.get(wrong, []), key=lambda m: (m is not None, m or ''))
                 keep = max(len(have) - undone, floor)
                 for m in have[keep:]:
+                    if m is None:
+                        owner = next(c for c in changing if c['wrong_uuid'] == wrong)
+                        problem(
+                            owner, 'a mention of the wrong node to remove is without a uuid', False
+                        )
+                        continue
                     plan['mentions_drop'].append(
                         {'uuid': m, 'graph': graph, 'episode': episode_uuid, 'entity': wrong}
                     )
@@ -689,11 +735,29 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     t.summary = earlier['target_after']
             before_summary = {t.uuid: t.summary for t in unique_targets}
             if unique_targets:
+                # A target is handed one edge per end it gains, never one it already held: it got that
+                # line when the fact was made. A loop made by the move gains its node one end, not two.
                 moved_edges = []
+                target_ids = {t.uuid for t in unique_targets}
                 for m in moved_here:
+                    gained = ends(m['new_source'], m['new_target']) - ends(
+                        m['old_source'], m['old_target']
+                    )
+                    if not target_ids & set(gained):
+                        continue
                     edge = await EntityEdge.get_by_uuid(driver, m['uuid'])
-                    edge.source_node_uuid, edge.target_node_uuid = m['new_source'], m['new_target']
-                    moved_edges.append(edge)
+                    for node, count in gained.items():
+                        if node in target_ids:
+                            moved_edges += [
+                                edge.model_copy(
+                                    update={
+                                        'uuid': str(uuidlib.uuid4()),
+                                        'source_node_uuid': node,
+                                        'target_node_uuid': NO_NODE,
+                                    }
+                                )
+                                for _ in range(count)
+                            ]
                 # One pass for the episode, as add_episode makes it: Graphiti appends short facts
                 # itself and asks the model only for a node with no summary yet or one grown too long.
                 await extract_attributes_from_nodes(
@@ -718,7 +782,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     entry.setdefault('wrong_before', c['wrong_summary'])
                     entry['name'] = c['wrong']
     finally:
-        await drivers[graphs[0]].close()
+        await next(iter(drivers.values())).close()
 
     for m in moves.values():
         m.pop('_episode', None)
@@ -792,6 +856,10 @@ def report(plan: dict) -> str:
         out.append(
             f'{c["graph"]} {c["entity"]!r} <- was in {c["wrong"]!r}: {c["decision"]} -> {c.get("target_name")!r}'
         )
+        if c.get('dedupe_warning'):
+            out.append(f'    dedupe warned: {c["dedupe_warning"][:300]}')
+    if plan.get('missing_graphs'):
+        out.append(f'graphs that do not exist, left out: {plan["missing_graphs"]}')
     out.append('')
     out.append(
         f'new nodes {len(plan["new_nodes"])}, mentions added {len(plan["mentions_add"])}, '
@@ -799,9 +867,15 @@ def report(plan: dict) -> str:
         f'summaries edited {len(plan["summary_edits"])}, problems {len(plan["problems"])}'
     )
     for m in plan['edge_moves']:
+        later = m.get('episodes', 1) - 1
         out.append(
             f'  fact {m["fact"][:120]!r}: {m["old_source"][:8]}->{m["old_target"][:8]} becomes '
             f'{m["new_source"][:8]}->{m["new_target"][:8]}'
+            + (
+                f' (joined by {later} later episode{"s" if later > 1 else ""}, moved with it)'
+                if later
+                else ''
+            )
         )
     for e in plan['summary_edits']:
         out.append(
@@ -822,10 +896,26 @@ def report(plan: dict) -> str:
 def preflight(g, ops: dict) -> list[str]:
     """What in the graph no longer matches the plan. Already-done steps are not problems."""
     bad = []
+    # The graph may have moved on between plan and apply: a node the plan would create may exist
+    # under another uuid by now, and a node the plan sends something to may be gone.
+    names = collections.defaultdict(set)
+    for u, n in all_rows(g, 'MATCH (n:Entity)', 'n.uuid, n.name', 'n.uuid'):
+        names[norm(n)].add(u)
     for n in ops['new_nodes']:
         got = rows(g, 'MATCH (n:Entity {uuid: $u}) RETURN n.name', u=n['uuid'])
         if got and got[0][0] != n['name']:
             bad.append(f'node {n["uuid"]} exists under another name')
+        others = names.get(norm(n['name']), set()) - {n['uuid']}
+        if others:
+            bad.append(f'a node named {n["name"]!r} appeared since the plan: {sorted(others)}')
+    planned = {n['uuid'] for n in ops['new_nodes']}
+    needed = {m['entity'] for m in ops['mentions_add']} | {
+        e['node_uuid'] for e in ops['summary_edits']
+    }
+    needed |= {u for mv in ops['edge_moves'] for u in (mv['new_source'], mv['new_target'])}
+    present = {u for us in names.values() for u in us}
+    for u in sorted(needed - planned - present):
+        bad.append(f'node {u} the plan sends to is gone')
     for m in ops['mentions_add']:
         if not rows(g, 'MATCH (e:Episodic {uuid: $e}) RETURN e.uuid', e=m['episode']):
             bad.append(f'episode {m["episode"]} is missing')
@@ -918,11 +1008,17 @@ async def write(conn: dict, graph_name: str, ops: dict) -> collections.Counter:
         if [list(x) for x in at] == [[mv['new_source'], mv['new_target']]]:
             continue
         # The same edge on new ends: every property copied as it is, then the two end uuids it records.
+        # Only the end that moves has its recorded uuid rewritten; the other keeps what it records.
+        moved_ends = []
+        if mv['new_source'] != mv['old_source']:
+            moved_ends.append('r2.source_node_uuid = $ns')
+        if mv['new_target'] != mv['old_target']:
+            moved_ends.append('r2.target_node_uuid = $nt')
         g.query(
             'MATCH (a:Entity {uuid: $os})-[r:RELATES_TO {uuid: $u}]->(b:Entity {uuid: $ot}) '
             'MATCH (na:Entity {uuid: $ns}), (nb:Entity {uuid: $nt}) '
             'CREATE (na)-[r2:RELATES_TO]->(nb) SET r2 = properties(r) '
-            'SET r2.source_node_uuid = $ns, r2.target_node_uuid = $nt DELETE r',
+            f'SET {", ".join(moved_ends)} DELETE r',
             {
                 'u': mv['uuid'],
                 'os': mv['old_source'],
@@ -977,6 +1073,7 @@ async def apply(
         print(f'graph {target!r} does not exist', file=sys.stderr)
         return 2
     g = db.select_graph(target)
+    ops = ops_for(plan, source)
     if target == source:
         # The real graph: only with the server stopped -- a write of its own in between would undo
         # a summary edit or duplicate a moved fact -- and with a copy taken just now that still
@@ -988,25 +1085,27 @@ async def apply(
                 file=sys.stderr,
             )
             return 2
-        if not backup or backup not in graphs:
+        if not backup or backup not in graphs or backup in (source, target):
             print(
-                'writing to the graph the plan was made from needs --backup naming an existing copy',
+                'writing to the graph the plan was made from needs --backup naming an existing copy '
+                'that is another graph',
                 file=sys.stderr,
             )
             return 2
-        if snapshot(db.select_graph(backup), source) != snapshot(g, source):
-            print(
-                f'backup {backup!r} does not match {target!r}: take the copy again', file=sys.stderr
-            )
-            return 2
-    ops = ops_for(plan, source)
+    before = snapshot(g, source)
+    # The copy and the graph -- untouched, or part way through a run that stopped -- must lead to
+    # the same graph under the plan; a copy that is stale or of something else does not.
+    if target == source and expected_after(
+        snapshot(db.select_graph(backup), source), ops, source
+    ) != expected_after(before, ops, source):
+        print(f'backup {backup!r} does not match {target!r}: take the copy again', file=sys.stderr)
+        return 2
     bad = preflight(g, ops)
     if bad:
         print('the graph does not match the plan; nothing was written:', file=sys.stderr)
         for b in bad:
             print('  ' + b, file=sys.stderr)
         return 3
-    before = snapshot(g, source)
     done = await write(conn, target, ops)
     after = snapshot(g, source)
     again = await write(conn, target, ops)
@@ -1016,7 +1115,7 @@ async def apply(
         if not sum(again.values())
         else f'SECOND PASS WROTE {dict(again)}'
     )
-    problems = compare(before, after, ops)
+    problems = compare(before, after, ops, source)
     if ops['new_nodes']:
         # The vectors written must be as long as the ones already there.
         reference = next(

@@ -23,7 +23,7 @@ from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig
-from tools.unmerge_old_dedupe import compare, norm, remove_fact_lines
+from tools.unmerge_old_dedupe import checks_of, compare, norm, remove_fact_lines
 
 PORT = os.environ.get('UNMERGE_TEST_FALKOR_PORT')
 needs_db = pytest.mark.skipif(not PORT, reason='UNMERGE_TEST_FALKOR_PORT is not set')
@@ -87,11 +87,18 @@ def snap(**over):
             }
         },
         'mentions': {
-            'm': {'episode': 'e', 'entity': 'w', 'from_episodic': True, 'to_entity': True}
+            'm': {
+                'episode': 'e',
+                'entity': 'w',
+                'from_episodic': True,
+                'to_entity': True,
+                'has_uuid': True,
+            }
         },
-        'checks': {'entity_without_mention': 0, 'edge_self_loop': 0},
+        'episodes': ['e'],
     }
     base.update(over)
+    base.setdefault('checks', checks_of(base, 'main'))
     return base
 
 
@@ -105,29 +112,30 @@ NO_OPS = {
 
 
 def test_compare_accepts_identical_snapshots():
-    assert compare(snap(), snap(), NO_OPS) == []
+    assert compare(snap(), snap(), NO_OPS, 'main') == []
 
 
 def test_compare_names_a_summary_change_the_plan_did_not_make():
     after = snap()
     after['entities'] = {'w': dict(after['entities']['w'], summary='other')}
-    assert any('beyond the plan' in p for p in compare(snap(), after, NO_OPS))
+    assert any(p.startswith('entity w:') for p in compare(snap(), after, NO_OPS, 'main'))
 
 
 def test_compare_names_a_fact_moved_without_the_plan():
     after = snap()
     after['edges'] = {'r': dict(after['edges']['r'], source='x', source_prop='x')}
-    assert any('fact r' in p for p in compare(snap(), after, NO_OPS))
+    assert any(p.startswith('fact r:') for p in compare(snap(), after, NO_OPS, 'main'))
 
 
 def test_compare_names_a_lost_episode():
     after = snap(labels={"['Episodic']": 1, "['Entity']": 2})
-    assert any('Episodic' in p for p in compare(snap(), after, NO_OPS))
+    assert any('Episodic' in p for p in compare(snap(), after, NO_OPS, 'main'))
 
 
 def test_compare_names_a_new_orphan_entity():
-    after = snap(checks={'entity_without_mention': 1, 'edge_self_loop': 0})
-    assert any('entity_without_mention' in p for p in compare(snap(), after, NO_OPS))
+    after = snap(mentions={})
+    problems = compare(snap(), after, NO_OPS, 'main')
+    assert any('entity_without_mention' in p for p in problems)
 
 
 # ---------------------------------------------------------------- the graph
@@ -146,6 +154,8 @@ def vector(name: str) -> list[float]:
         'Google Mail': 'Gmail',
         'Prague': 'Прага',
         'Brno': 'Брно',
+        'ФСИН России': 'ФСИН',
+        'Чемезов': 'Ростех',
     }
     key = shared.get(name, name)
     axis = AXES.setdefault(key, len(AXES) % DIM)
@@ -191,13 +201,14 @@ class LLM(LLMClient):
             rows = []
             for e in json.loads(ENTITIES.search(messages[-1].content).group(1)):
                 want = self.choices.get(e['name'])
+                want, echo = want if isinstance(want, tuple) else (want, want)
                 hit = next((c for c in e.get('candidates', []) if c['name'] == want), None)
                 rows.append(
                     {
                         'id': e['id'],
                         'name': e['name'],
                         'duplicate_candidate_id': hit['candidate_id'] if hit else -1,
-                        'duplicate_candidate_name': hit['name'] if hit else '',
+                        'duplicate_candidate_name': echo if hit else '',
                     }
                 )
             return {'entity_resolutions': rows}
@@ -216,7 +227,15 @@ def services(choices=None):
     return {
         'llm': LLM(
             choices
-            or {'BBC News': 'BBC', 'Google Mail': 'Gmail', 'Prague': 'Прага', 'Brno': 'Брно'}
+            or {
+                'BBC News': 'BBC',
+                'Google Mail': 'Gmail',
+                'Prague': 'Прага',
+                'Brno': 'Брно',
+                'ФСИН России': 'ФСИН',
+                # Names Ростех wrongly every time: the check fails on every question.
+                'Чемезов': ('Ростех', 'Ростех-не-тот'),
+            }
         ),
         'embedder': Embedder(),
         'cross_encoder': CrossEncoder(),
@@ -347,6 +366,9 @@ async def seed():
             'Росатом',
             'Минфин',
             'Ростех',
+            'Минобороны',
+            'ФСИН',
+            'МВД2',
         ],
         facts=[
             ('Чернобыльская АЭС', 'Киев', 'Чернобыльская АЭС находится рядом с Киевом'),
@@ -358,6 +380,8 @@ async def seed():
             'Оксфорд': 'Университет.',
             'Росатом': 'Госкорпорация.',
             'Минфин': 'Министерство.',
+            'Минобороны': 'Ведомство.',
+            'ФСИН': 'Служба.',
         },
     )
     # Пентагон wrongly merged into Чернобыльская АЭС; no facts.
@@ -384,7 +408,16 @@ async def seed():
     # ВСУ into Донецк, while the episode named Донецк itself.
     await episode('e5', 50, 'ВСУ и Донецк', ['Донецк'])
     # BBC News into ViT; the new dedupe finds BBC, which the episode already named itself.
-    await episode('e6', 60, 'BBC News сообщает, BBC подтверждает', ['ViT', 'BBC'])
+    # Its fact about BBC then becomes a loop on BBC, as add_episode would have made it.
+    quote = 'BBC News цитирует BBC'
+    await episode(
+        'e6',
+        60,
+        'BBC News сообщает, BBC подтверждает',
+        ['ViT', 'BBC'],
+        facts=[('ViT', 'BBC', quote)],
+        summaries={'ViT': quote, 'BBC': quote},
+    )
     # Яндекс into Оксфорд with a fact: Яндекс gains facts from two episodes.
     await episode(
         'e7',
@@ -432,6 +465,22 @@ async def seed():
     await episode('e15', 150, 'Чемезов и Ростех', ['Ростех', 'Ростех'])
     # A case the trace could not explain.
     await episode('e16', 160, 'неясно', ['ViT'])
+    # Росгвардия into Минобороны, ФСИН России into МВД2 and found to be ФСИН: the moved fact's other
+    # end is a target that already holds it. Later e5 joined that fact as well.
+    guard = 'Росгвардия передала дела ФСИН'
+    await episode(
+        'e17',
+        170,
+        'Росгвардия и ФСИН',
+        ['Минобороны', 'ФСИН', 'МВД2'],
+        facts=[('Минобороны', 'ФСИН', guard)],
+        summaries={'Минобороны': f'Ведомство.\n{guard}', 'ФСИН': f'Служба.\n{guard}'},
+    )
+    await driver.execute_query(
+        'MATCH ()-[r:RELATES_TO]->() WHERE r.fact = $f SET r.episodes = r.episodes + [$e]',
+        f=guard,
+        e=episodes['e5'].uuid,
+    )
     return driver, episodes, made, sanctions
 
 
@@ -473,7 +522,14 @@ def cases(episodes, sanctions):
             'entity_facts': [],
             'keep_mention': True,
         },
-        {'entity': 'BBC News', 'wrong': 'ViT', 'episode_content': text('e6'), 'entity_facts': []},
+        {
+            'entity': 'BBC News',
+            'wrong': 'ViT',
+            'episode_content': text('e6'),
+            'entity_facts': [
+                {'source': 'BBC News', 'target': 'BBC', 'fact': 'BBC News цитирует BBC'}
+            ],
+        },
         {
             'entity': 'Нет такого',
             'wrong': 'ViT',
@@ -560,6 +616,20 @@ def cases(episodes, sanctions):
             'entity_facts': [],
             'unknown': True,
         },
+        {
+            'entity': 'Росгвардия',
+            'wrong': 'Минобороны',
+            'episode_content': text('e17'),
+            'entity_facts': [
+                {'source': 'Росгвардия', 'target': 'ФСИН', 'fact': 'Росгвардия передала дела ФСИН'}
+            ],
+        },
+        {
+            'entity': 'ФСИН России',
+            'wrong': 'МВД2',
+            'episode_content': text('e17'),
+            'entity_facts': [],
+        },
     ]
 
 
@@ -598,6 +668,7 @@ def test_plan_sends_each_entity_where_the_new_dedupe_puts_it(db):
         'Набиуллина',
         'Чемезов',
         'Gmail Inc',
+        'Росгвардия',
     }
     # Every new node carries the attributes Graphiti gave it, empty or not, for write to keep.
     assert all(isinstance(n['attributes'], dict) for n in plan['new_nodes'])
@@ -836,9 +907,15 @@ def test_compare_names_a_mention_the_plan_did_not_add():
     after = snap()
     after['mentions'] = dict(
         after['mentions'],
-        x={'episode': 'e', 'entity': 'z', 'from_episodic': True, 'to_entity': True},
+        x={
+            'episode': 'e',
+            'entity': 'z',
+            'from_episodic': True,
+            'to_entity': True,
+            'has_uuid': True,
+        },
     )
-    assert any('mentions' in p for p in compare(snap(), after, NO_OPS))
+    assert any(p.startswith('mention x:') for p in compare(snap(), after, NO_OPS, 'main'))
 
 
 @needs_db
@@ -986,6 +1063,8 @@ def test_plan_builds_no_indices_on_the_live_graph(db, monkeypatch):
             return nothing()
 
         monkeypatch.setattr(FalkorDriver, '_build_indices_once', record)
+        # Marks left by earlier tests could match a reused object id and hide a missing mark.
+        monkeypatch.setattr(FalkorDriver, '_indexed_graphs', set())
         await make_plan(cases(episodes, sanctions), [GROUP], services())
         return scheduled
 
@@ -1088,5 +1167,215 @@ def test_apply_builds_no_indices_on_the_graph_it_repairs(db, monkeypatch, capsys
         return nothing()
 
     monkeypatch.setattr(FalkorDriver, '_build_indices_once', record)
+    monkeypatch.setattr(FalkorDriver, '_indexed_graphs', set())
     assert asyncio.run(apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 0
     assert scheduled == []
+
+
+@needs_db
+def test_apply_refuses_a_backup_that_is_the_source_itself(db, capsys):
+    from tools.unmerge_old_dedupe import apply
+
+    plan, _, _, _ = asyncio.run(made_plan())
+    code = asyncio.run(
+        apply(json.loads(json.dumps(plan)), GROUP, GROUP, GROUP, server_stopped=True)
+    )
+    assert code == 2
+
+
+@needs_db
+def test_a_target_gains_no_line_for_an_end_it_already_held(db):
+    plan, _, made, _ = asyncio.run(made_plan())
+    guard = 'Росгвардия передала дела ФСИН'
+    c = by_entity(plan)
+    assert c[('ФСИН России', 'МВД2')]['target_uuid'] == made['ФСИН'].uuid
+    rosgvardia = c[('Росгвардия', 'Минобороны')]['target_uuid']
+    (move,) = by_fact(plan, guard)
+    assert (move['new_source'], move['new_target']) == (rosgvardia, made['ФСИН'].uuid)
+    edits = {e['node_uuid']: e for e in plan['summary_edits']}
+    assert made['ФСИН'].uuid not in edits
+    assert edits[made['Минобороны'].uuid]['after'] == 'Ведомство.'
+    new = {n['name']: n for n in plan['new_nodes']}
+    assert new['Росгвардия']['summary'].count(guard) == 1
+
+
+@needs_db
+def test_a_move_that_makes_a_loop_is_planned_as_add_episode_would_have_made_it(db, capsys):
+    from tools.unmerge_old_dedupe import apply
+
+    plan, _, made, _ = asyncio.run(made_plan())
+    quote = 'BBC News цитирует BBC'
+    bbc = made['BBC'].uuid
+    (move,) = by_fact(plan, quote)
+    assert (move['new_source'], move['new_target']) == (bbc, bbc)
+    edits = {e['node_uuid']: e for e in plan['summary_edits']}
+    assert edits[bbc]['after'] == f'{quote}\n{quote}'
+    assert edits[made['ViT'].uuid]['after'] == ''
+    copy_graph(db, GROUP, 'main_copy')
+    assert asyncio.run(apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 0
+
+
+@needs_db
+def test_plan_shows_a_moved_fact_that_later_episodes_joined(db):
+    from tools.unmerge_old_dedupe import report
+
+    plan, _, _, _ = asyncio.run(made_plan())
+    (move,) = by_fact(plan, 'Росгвардия передала дела ФСИН')
+    assert move['episodes'] == 2
+    assert 'joined by 1 later episode' in report(plan)
+
+
+@needs_db
+def test_a_new_node_after_a_failed_check_is_marked(db):
+    plan, _, _, _ = asyncio.run(made_plan())
+    record = by_entity(plan)[('Чемезов', 'Ростех')]
+    assert record['decision'] == 'new'
+    assert 'failed the check' in record['dedupe_warning']
+    assert not by_entity(plan)[('Пентагон', 'Чернобыльская АЭС')].get('dedupe_warning')
+
+
+@needs_db
+def test_apply_refuses_when_the_graph_grew_a_node_of_a_new_nodes_name(db, capsys):
+    from tools.unmerge_old_dedupe import apply
+
+    plan, _, _, _ = asyncio.run(made_plan())
+    copy_graph(db, GROUP, 'main_copy')
+    db.select_graph('main_copy').query(
+        "CREATE (:Entity {uuid: 'later', name: 'пентагон', group_id: 'main'})"
+    )
+    assert asyncio.run(apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 3
+
+
+@needs_db
+def test_apply_refuses_when_a_target_is_gone(db, capsys):
+    from tools.unmerge_old_dedupe import apply
+
+    plan, _, made, _ = asyncio.run(made_plan())
+    copy_graph(db, GROUP, 'main_copy')
+    db.select_graph('main_copy').query(
+        'MATCH (n:Entity {uuid: $u}) DETACH DELETE n', {'u': made['Яндекс'].uuid}
+    )
+    assert asyncio.run(apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 3
+
+
+@needs_db
+def test_a_moved_fact_keeps_the_recorded_end_it_did_not_move(db, capsys):
+    from tools.unmerge_old_dedupe import apply
+
+    plan, _, made, _ = asyncio.run(made_plan())
+    copy_graph(db, GROUP, 'main_copy')
+    move = next(m for m in plan['edge_moves'] if m['old_target'] == made['Ozon'].uuid)
+    g = db.select_graph('main_copy')
+    g.query(
+        "MATCH ()-[r:RELATES_TO {uuid: $u}]->() SET r.target_node_uuid = 'stale'",
+        {'u': move['uuid']},
+    )
+    assert asyncio.run(apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 0, (
+        capsys.readouterr().out
+    )
+    got = g.ro_query(
+        'MATCH ()-[r:RELATES_TO {uuid: $u}]->() RETURN r.source_node_uuid, r.target_node_uuid',
+        {'u': move['uuid']},
+    ).result_set
+    assert got == [[move['new_source'], 'stale']]
+
+
+@needs_db
+def test_mentions_without_uuid_are_counted_one_by_one(db):
+    from tools.unmerge_old_dedupe import snapshot
+
+    g = db.select_graph('probe')
+    g.query(
+        "CREATE (e:Episodic {uuid: 'e'}), (n:Entity {uuid: 'n', group_id: 'probe'}), "
+        '(e)-[:MENTIONS]->(n), (e)-[:MENTIONS]->(n)'
+    )
+    snap = snapshot(g, 'probe')
+    assert len(snap['mentions']) == 2
+    assert snap['checks']['entity_without_mention'] == 0
+    assert snap['checks']['mention_without_uuid'] == 2
+
+
+@needs_db
+def test_a_mention_to_drop_without_uuid_stops_apply(db, capsys):
+    from tools.unmerge_old_dedupe import apply, make_plan
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        await driver.execute_query(
+            'MATCH (e:Episodic {uuid: $e})-[m:MENTIONS]->(n:Entity {uuid: $n}) '
+            'DELETE m CREATE (e)-[:MENTIONS]->(n)',
+            e=episodes['e1'].uuid,
+            n=made['Чернобыльская АЭС'].uuid,
+        )
+        return await make_plan(cases(episodes, sanctions), [GROUP], services())
+
+    plan = asyncio.run(run())
+    assert [p for p in plan['problems'] if 'without a uuid' in p['why'] and not p['skipped']]
+    copy_graph(db, GROUP, 'main_copy')
+    assert asyncio.run(apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 2
+
+
+@needs_db
+def test_apply_finishes_an_interrupted_write_on_the_source(db, capsys):
+    from tools.unmerge_old_dedupe import apply, config_and_connection, ops_for, write
+
+    plan, _, _, _ = asyncio.run(made_plan())
+    plan = json.loads(json.dumps(plan))
+    copy_graph(db, GROUP, 'main_backup')
+    half = copy.deepcopy(ops_for(plan, GROUP))
+    half['edge_moves'] = half['edge_moves'][:2]
+    half['mentions_drop'] = half['mentions_drop'][:3]
+    half['summary_edits'] = []
+    asyncio.run(write(config_and_connection()[1], GROUP, half))
+    code = asyncio.run(apply(plan, GROUP, GROUP, 'main_backup', server_stopped=True))
+    assert code == 0, capsys.readouterr()
+
+
+@needs_db
+def test_plan_leaves_out_a_graph_that_does_not_exist(db):
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        return await make_plan(cases(episodes, sanctions), [GROUP, 'no_such_graph'], services())
+
+    plan = asyncio.run(run())
+    assert plan['graphs'] == [GROUP]
+    assert plan['missing_graphs'] == ['no_such_graph']
+
+
+@needs_db
+def test_preflight_names_a_node_the_plan_sends_to_that_is_gone(db):
+    from tools.unmerge_old_dedupe import preflight
+
+    g = db.select_graph('probe')
+    g.query("CREATE (:Episodic {uuid: 'e'}), (:Entity {uuid: 'here', name: 'Здесь'})")
+    ops = {
+        'new_nodes': [],
+        'mentions_add': [{'uuid': 'm', 'graph': 'probe', 'episode': 'e', 'entity': 'ghost'}],
+        'mentions_drop': [],
+        'edge_moves': [],
+        'summary_edits': [],
+    }
+    assert preflight(g, ops) == ['node ghost the plan sends to is gone']
+
+
+@needs_db
+def test_a_mention_without_uuid_is_the_one_kept_when_one_of_two_goes(db):
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        await driver.execute_query(
+            'MATCH (e:Episodic {uuid: $e})-[m:MENTIONS]->(n:Entity {uuid: $n}) '
+            'WITH e, n, m LIMIT 1 DELETE m CREATE (e)-[:MENTIONS]->(n)',
+            e=episodes['e15'].uuid,
+            n=made['Ростех'].uuid,
+        )
+        plan = await make_plan(cases(episodes, sanctions), [GROUP], services())
+        return plan, episodes['e15'].uuid
+
+    plan, e15 = asyncio.run(run())
+    assert not [p for p in plan['problems'] if 'without a uuid' in p['why']]
+    dropped = [m for m in plan['mentions_drop'] if m['episode'] == e15]
+    assert len(dropped) == 1 and dropped[0]['uuid'] is not None
