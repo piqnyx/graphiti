@@ -1749,3 +1749,189 @@ def test_only_graphs_with_cases_are_copied(db, monkeypatch):
     asyncio.run(run())
     assert seen and all('other__unmerge_plan' not in graphs for graphs in seen)
     assert all('main__unmerge_plan' in graphs for graphs in seen)
+
+
+def sibling_case(monkeypatch):
+    """eA makes W, P and W2; eB makes S and W3, names P again, and wrongly merges Альфа into W and
+    Гамма into W3; eC wrongly merges Бета into W2. Альфа and Бета are as near to S as to P; Гамма is
+    near W3 only. A node is dated as the episode that made it began, the closest it can be."""
+    from graphiti_core.driver.falkordb_driver import FalkorDriver
+    from graphiti_core.edges import EpisodicEdge
+    from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
+    from graphiti_core.utils.bulk_utils import add_nodes_and_edges_bulk
+    from tools.unmerge_old_dedupe import make_plan
+
+    monkeypatch.setitem(CUSTOM, 'Альфа', unit(65, 1.0))
+    monkeypatch.setitem(CUSTOM, 'Бета', unit(66, 1.0))
+    monkeypatch.setitem(CUSTOM, 'S', unit(70, 0.9))
+    monkeypatch.setitem(CUSTOM, 'P', unit(71, 0.9))
+    for i, name in enumerate(('W', 'W2', 'W3')):
+        monkeypatch.setitem(CUSTOM, name, unit(100 + i, 0.0))
+    gamma = [0.0] * DIM
+    gamma[102], gamma[110] = 0.9, (1 - 0.81) ** 0.5
+    monkeypatch.setitem(CUSTOM, 'Гамма', gamma)
+
+    async def run():
+        driver = FalkorDriver(host='127.0.0.1', port=int(PORT), database=GROUP)
+        await driver.build_indices_and_constraints()
+        emb = Embedder()
+        nodes = {}
+        texts = {}
+        plan_of = (
+            (0, 'eA', ['W', 'P', 'W2'], []),
+            # W3 is dated as only a node of eB is; it is still a wrong node, which the trace showed
+            # as a candidate, so it existed.
+            (10, 'eB', ['S', 'W3'], ['W', 'P']),
+            (20, 'eC', [], ['W2']),
+        )
+        for minutes, key, made, also in plan_of:
+            ep = EpisodicNode(
+                name=key,
+                group_id=GROUP,
+                labels=[],
+                source=EpisodeType.json,
+                source_description='chat',
+                content=json.dumps({'text': key}),
+                created_at=T0 + timedelta(minutes=minutes),
+                valid_at=T0 + timedelta(minutes=minutes),
+            )
+            texts[key] = ep.content
+            for n in made:
+                nodes[n] = EntityNode(
+                    name=n,
+                    group_id=GROUP,
+                    labels=['Entity'],
+                    summary='',
+                    created_at=ep.created_at,
+                    name_embedding=vector(n),
+                )
+            await add_nodes_and_edges_bulk(
+                driver,
+                [ep],
+                [
+                    EpisodicEdge(
+                        source_node_uuid=ep.uuid,
+                        target_node_uuid=nodes[n].uuid,
+                        group_id=GROUP,
+                        created_at=ep.created_at,
+                    )
+                    for n in made + also
+                ],
+                [nodes[n] for n in made],
+                [],
+                emb,
+            )
+        llm = LLM({})
+        plan = await make_plan(
+            [
+                {
+                    'entity': 'Альфа',
+                    'wrong': 'W',
+                    'episode_content': texts['eB'],
+                    'entity_facts': [],
+                },
+                {
+                    'entity': 'Гамма',
+                    'wrong': 'W3',
+                    'episode_content': texts['eB'],
+                    'entity_facts': [],
+                },
+                {
+                    'entity': 'Бета',
+                    'wrong': 'W2',
+                    'episode_content': texts['eC'],
+                    'entity_facts': [],
+                },
+            ],
+            [GROUP],
+            {
+                'llm': llm,
+                'embedder': Embedder(),
+                'cross_encoder': CrossEncoder(),
+                'entity_types': None,
+            },
+        )
+        return plan, llm
+
+    return asyncio.run(run())
+
+
+@needs_db
+def test_a_node_its_own_episode_made_is_not_offered_to_that_episodes_entities(db, monkeypatch):
+    # add_episode saves its nodes at the end: while an episode's entities were resolved, the nodes the
+    # same episode went on to make did not exist yet. An older node stays a candidate.
+    plan, llm = sibling_case(monkeypatch)
+    (offered,) = llm.offered['Альфа']
+    assert 'P' in offered and 'S' not in offered
+
+
+@needs_db
+def test_a_node_hidden_for_its_own_episode_is_back_for_a_later_one(db, monkeypatch):
+    plan, llm = sibling_case(monkeypatch)
+    (offered,) = llm.offered['Бета']
+    assert 'S' in offered and 'P' in offered
+
+
+@needs_db
+def test_the_wrong_node_stays_a_candidate_however_it_is_dated(db, monkeypatch):
+    plan, llm = sibling_case(monkeypatch)
+    (offered,) = llm.offered['Гамма']
+    assert offered == ['W3']
+
+
+@needs_db
+def test_made_by_episode_takes_the_nodes_dated_from_its_start_on(db):
+    from tools.unmerge_old_dedupe import made_by_episode
+
+    g = db.select_graph('probe')
+    g.query(
+        "CREATE (e:Episodic {uuid: 'E', created_at: '2026-10-03T17:16:38.071249+00:00'}), "
+        "(e)-[:MENTIONS]->(:Entity {uuid: 'before', created_at: '2026-10-03T17:16:38.071248+00:00'}), "
+        "(e)-[:MENTIONS]->(:Entity {uuid: 'same', created_at: '2026-10-03T17:16:38.071249+00:00'}), "
+        "(e)-[:MENTIONS]->(:Entity {uuid: 'after', created_at: '2026-10-03T17:16:49.503466+00:00'}), "
+        "(e)-[:MENTIONS]->(:Entity {uuid: 'undated'}), "
+        "(e)-[:MENTIONS]->(:Entity {uuid: 'kept', created_at: '2026-10-03T17:16:49+00:00'}), "
+        "(e)-[:MENTIONS]->(t:Entity {uuid: 'twice', created_at: '2026-10-03T17:16:50+00:00'}), "
+        '(e)-[:MENTIONS]->(t), '
+        "(:Entity {uuid: 'elsewhere', created_at: '2026-10-03T17:16:50+00:00'})"
+    )
+    assert made_by_episode(g, 'E', {'kept'}) == ['after', 'same', 'twice']
+
+
+@needs_db
+def test_the_plan_writes_to_its_scratch_copies_only(db, monkeypatch):
+    # Hiding a node for one episode is a write: it lands on the copy, never on the graph itself, not
+    # even for a moment that a before-and-after comparison would not see.
+    from falkordb.asyncio.graph import AsyncGraph
+    from falkordb.graph import Graph
+
+    import tools.unmerge_old_dedupe as tool
+
+    writes: list[str] = []
+    watching: list[bool] = []
+    real_plan = tool.make_plan
+
+    async def watched_plan(*args, **kwargs):
+        watching.append(True)
+        try:
+            return await real_plan(*args, **kwargs)
+        finally:
+            watching.clear()
+
+    real_sync, real_async = Graph._query, AsyncGraph._query
+
+    def sync_query(self, q, params=None, timeout=None, read_only=False):
+        if watching and not read_only:
+            writes.append(self.name)
+        return real_sync(self, q, params=params, timeout=timeout, read_only=read_only)
+
+    async def async_query(self, q, params=None, timeout=None, read_only=False):
+        if watching and not read_only:
+            writes.append(self.name)
+        return await real_async(self, q, params=params, timeout=timeout, read_only=read_only)
+
+    monkeypatch.setattr(Graph, '_query', sync_query)
+    monkeypatch.setattr(AsyncGraph, '_query', async_query)
+    monkeypatch.setattr(tool, 'make_plan', watched_plan)
+    plan, llm = sibling_case(monkeypatch)
+    assert writes and set(writes) == {GROUP + tool.SCRATCH_SUFFIX}

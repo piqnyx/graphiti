@@ -76,6 +76,8 @@ PAGE = 5000
 NO_NODE = '__unmerge_no_node__'
 # The plan's scratch copy of a graph is named after it with this ending, and removed when it is done.
 SCRATCH_SUFFIX = '__unmerge_plan'
+# On the scratch copy, a node hidden from the dedupe's search for one episode carries this group id.
+HIDDEN_GROUP = '__unmerge_hidden__'
 
 
 # ---------------------------------------------------------------- pure helpers
@@ -392,6 +394,30 @@ def ends(source: str, target: str) -> collections.Counter:
     return collections.Counter([source, target])
 
 
+def moment(value: Any) -> datetime:
+    return value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+
+
+def made_by_episode(graph, episode_uuid: str, keep: set[str]) -> list[str]:
+    """Nodes the episode mentions that are dated after it began: the old run made them in it.
+
+    add_episode resolves an episode's entities before it saves the nodes it makes, so these were no
+    candidates then. A node without a date is taken as older. `keep` are nodes known to have existed.
+    """
+    born = moment(
+        rows(graph, 'MATCH (e:Episodic {uuid: $e}) RETURN e.created_at', e=episode_uuid)[0][0]
+    )
+    return sorted(
+        n
+        for n, made in rows(
+            graph,
+            'MATCH (:Episodic {uuid: $e})-[:MENTIONS]->(n:Entity) RETURN DISTINCT n.uuid, n.created_at',
+            e=episode_uuid,
+        )
+        if n not in keep and made is not None and moment(made) >= born
+    )
+
+
 async def make_plan(
     cases: list[dict], graphs: list[str], services: Any = None, clear_scratch: bool = False
 ) -> dict:
@@ -643,10 +669,22 @@ async def make_plan(
             resolved = []
             caught: list[str] = []
             if extracted:
+                # The nodes this episode made in the old run are hidden from the search on the copy
+                # for this episode only. A wrong node was a candidate in the trace, so it existed.
+                scratch_graph = db.select_graph(scratch[graph])
+                hidden = rows(
+                    scratch_graph,
+                    'UNWIND $ns AS u MATCH (n:Entity {uuid: u}) RETURN n.uuid, n.group_id',
+                    ns=made_by_episode(g, episode_uuid, {c['wrong_uuid'] for c in group_cases}),
+                )
                 node_log = logging.getLogger('graphiti_core.utils.maintenance.node_operations')
                 handler = _Collect(caught)
                 node_log.addHandler(handler)
                 try:
+                    scratch_graph.query(
+                        'UNWIND $ns AS u MATCH (n:Entity {uuid: u}) SET n.group_id = $h',
+                        {'ns': [u for u, _ in hidden], 'h': HIDDEN_GROUP},
+                    )
                     resolved, _, _ = await resolve_extracted_nodes(
                         clients,
                         extracted,
@@ -656,6 +694,10 @@ async def make_plan(
                     )
                 finally:
                     node_log.removeHandler(handler)
+                    scratch_graph.query(
+                        'UNWIND $ps AS p MATCH (n:Entity {uuid: p[0]}) SET n.group_id = p[1]',
+                        {'ps': hidden},
+                    )
 
             for c in group_cases:
                 if c.get('skipped'):
