@@ -472,6 +472,9 @@ async def test_a_fault_in_building_a_second_question_is_not_swallowed(world, mon
         ("Marco's car", 'Marco\u2019s car'),
         ('«Дождь»', '"Дождь"'),
         ('Йошкар\u2011Ола', 'Йошкар-Ола'),
+        ('Level \u22121', 'Level -1'),
+        ('Об\u02bcєднання', "Об'єднання"),
+        ('5\u2032 lane', "5' lane"),
     ],
 )
 async def test_the_name_check_ignores_letter_forms_and_punctuation(
@@ -509,15 +512,15 @@ async def test_a_programming_fault_on_a_second_question_surfaces(world, fault):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'repeated, merged', [('--', True), (' -- ', True), ('', False), ('"', False), ('-', False)]
+    'repeated, merged', [('""', True), (' "" ', True), ('', False), ('"', False), ('-', False)]
 )
 async def test_a_name_left_with_nothing_is_compared_whole(world, monkeypatch, repeated, merged):
-    # Dashes, quotes and spacing do not count, so a name made only of them is left with
-    # nothing to compare; an answer must not pass merely because it is left with nothing too.
-    dashes = _node('--')
+    # Quotes and spacing do not count, so a name made only of them is left with nothing to
+    # compare; an answer must not pass merely because it is left with nothing too.
+    quotes = _node('""')
 
     async def search(*_, **__):
-        return [[dashes], [world.annie]]
+        return [[quotes], [world.annie]]
 
     monkeypatch.setattr(
         'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search', search
@@ -527,7 +530,7 @@ async def test_a_name_left_with_nothing_is_compared_whole(world, monkeypatch, re
     )
     resolved, _, _ = await _resolve(llm, world)
 
-    assert (resolved[0].uuid == dashes.uuid) is merged
+    assert (resolved[0].uuid == quotes.uuid) is merged
     assert len(llm.calls) == (1 if merged else 2)
 
 
@@ -554,6 +557,9 @@ async def test_the_final_warning_tells_what_happened_on_the_last_question(world,
         ('Windows 1.0', 'Windows 10'),
         ('iOS 1.7', 'iOS 17'),
         ('A.B.C.', 'ABC'),
+        ('Level 1', 'Level -1'),
+        ('Room 5', 'Room \u22125'),
+        ('Masse', 'Ma\u00dfe'),
     ],
 )
 async def test_names_that_differ_in_symbols_or_dots_are_different(
