@@ -383,6 +383,12 @@ def fact_role(entity: str, fact: dict) -> str | None:
     return None
 
 
+def cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    size = (sum(x * x for x in a) * sum(y * y for y in b)) ** 0.5
+    return dot / size if size else 0.0
+
+
 def ends(source: str, target: str) -> collections.Counter:
     """How many ends of an edge each node holds. Graphiti files a loop under its node twice."""
     return collections.Counter([source, target])
@@ -399,6 +405,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
     from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
     from graphiti_core.tracer import create_tracer
     from graphiti_core.utils.maintenance.node_operations import (
+        NODE_DEDUP_COSINE_MIN_SCORE,
         extract_attributes_from_nodes,
         resolve_extracted_nodes,
     )
@@ -602,13 +609,38 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
             ]
             resolved = []
             caught: list[str] = []
+            # Nodes this plan creates in earlier episodes would exist by now in a run that went
+            # episode by episode, and the dedupe finds a node by how close its name's vector is.
+            # Those close enough to an entity here, by Graphiti's own threshold, are offered too.
+            override = None
+            earlier = [n for (gr, _), n in planned_new.items() if gr == graph]
+            if earlier and extracted:
+                for n in earlier:
+                    if n.name_embedding is None:
+                        await n.generate_name_embedding(services['embedder'])
+                vectors = await services['embedder'].create_batch(
+                    [e.name.replace('\n', ' ') for e in extracted]
+                )
+                override = [
+                    n
+                    for n in earlier
+                    if any(
+                        (1 + cosine(v, n.name_embedding)) / 2 > NODE_DEDUP_COSINE_MIN_SCORE
+                        for v in vectors
+                    )
+                ] or None
             if extracted:
                 node_log = logging.getLogger('graphiti_core.utils.maintenance.node_operations')
                 handler = _Collect(caught)
                 node_log.addHandler(handler)
                 try:
                     resolved, _, _ = await resolve_extracted_nodes(
-                        clients, extracted, episode, previous, services['entity_types']
+                        clients,
+                        extracted,
+                        episode,
+                        previous,
+                        services['entity_types'],
+                        existing_nodes_override=override,
                     )
                 finally:
                     node_log.removeHandler(handler)
@@ -644,7 +676,17 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     record.update(decision='same_as_before', target_uuid=t.uuid, target_name=t.name)
                     plan['cases'].append(record)
                     continue
-                if t.uuid == e.uuid:
+                planned = next(
+                    (n for (gr, _), n in planned_new.items() if gr == graph and n.uuid == t.uuid),
+                    None,
+                )
+                if planned is not None:
+                    # The dedupe chose a node this plan creates in an earlier episode.
+                    t = planned
+                    record.update(decision='new_planned_earlier')
+                elif t.uuid == e.uuid:
+                    # A planned node of the same name is offered and taken by exact name above; this
+                    # only guards the one-node-per-name the plan keeps, should the dedupe say new anyway.
                     twin = planned_new.get((graph, norm(e.name)))
                     if twin is not None:
                         t = twin

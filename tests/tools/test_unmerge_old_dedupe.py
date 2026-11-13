@@ -156,6 +156,7 @@ def vector(name: str) -> list[float]:
         'Brno': 'Брно',
         'ФСИН России': 'ФСИН',
         'Чемезов': 'Ростех',
+        'Mikhail Fridman': 'Фридман',
     }
     key = shared.get(name, name)
     axis = AXES.setdefault(key, len(AXES) % DIM)
@@ -189,6 +190,7 @@ class LLM(LLMClient):
         super().__init__(LLMConfig(api_key='test'), cache=False)
         self.choices = choices
         self.calls = []
+        self.offered = {}
         self.summarized = []
 
     async def _generate_response(self, *args, **kwargs):
@@ -200,6 +202,9 @@ class LLM(LLMClient):
         if name.startswith('dedupe_nodes'):
             rows = []
             for e in json.loads(ENTITIES.search(messages[-1].content).group(1)):
+                self.offered.setdefault(e['name'], []).append(
+                    [c['name'] for c in e.get('candidates', [])]
+                )
                 want = self.choices.get(e['name'])
                 want, echo = want if isinstance(want, tuple) else (want, want)
                 hit = next((c for c in e.get('candidates', []) if c['name'] == want), None)
@@ -233,6 +238,7 @@ def services(choices=None):
                 'Prague': 'Прага',
                 'Brno': 'Брно',
                 'ФСИН России': 'ФСИН',
+                'Mikhail Fridman': 'Фридман',
                 # Names Ростех wrongly every time: the check fails on every question.
                 'Чемезов': ('Ростех', 'Ростех-не-тот'),
             }
@@ -369,6 +375,8 @@ async def seed():
             'Минобороны',
             'ФСИН',
             'МВД2',
+            'ReDroid',
+            'Артур',
         ],
         facts=[
             ('Чернобыльская АЭС', 'Киев', 'Чернобыльская АЭС находится рядом с Киевом'),
@@ -481,6 +489,10 @@ async def seed():
         f=guard,
         e=episodes['e5'].uuid,
     )
+    # Фридман into ReDroid, then Mikhail Fridman into Артур: in the run that had made Фридман's
+    # node by then, the second would have found it among its candidates.
+    await episode('e19', 190, 'Фридман', ['ReDroid'])
+    await episode('e20', 200, 'Mikhail Fridman', ['Артур'])
     return driver, episodes, made, sanctions
 
 
@@ -631,6 +643,18 @@ def cases(episodes, sanctions):
             'episode_content': text('e17'),
             'entity_facts': [],
         },
+        {
+            'entity': 'Фридман',
+            'wrong': 'ReDroid',
+            'episode_content': text('e19'),
+            'entity_facts': [],
+        },
+        {
+            'entity': 'Mikhail Fridman',
+            'wrong': 'Артур',
+            'episode_content': text('e20'),
+            'entity_facts': [],
+        },
     ]
 
 
@@ -667,6 +691,7 @@ def test_plan_sends_each_entity_where_the_new_dedupe_puts_it(db):
         'Чемезов',
         'Gmail Inc',
         'Росгвардия',
+        'Фридман',
     }
     # Every new node carries the attributes Graphiti gave it, empty or not, for write to keep.
     assert all(isinstance(n['attributes'], dict) for n in plan['new_nodes'])
@@ -1476,3 +1501,33 @@ def test_a_moved_fact_the_target_already_has_is_shown(db):
     (move,) = by_fact(plan, 'BBC News цитирует BBC')
     assert move['duplicates_existing'] == ['dup']
     assert 'same fact already there' in report(plan)
+
+
+async def made_plan_with_llm():
+    from tools.unmerge_old_dedupe import make_plan
+
+    driver, episodes, made, sanctions = await seed()
+    svc = services()
+    plan = await make_plan(cases(episodes, sanctions), [GROUP], svc)
+    return plan, svc['llm']
+
+
+@needs_db
+def test_a_node_the_plan_creates_is_a_candidate_for_later_episodes(db):
+    plan, _ = asyncio.run(made_plan_with_llm())
+    c = by_entity(plan)
+    first, later = c[('Фридман', 'ReDroid')], c[('Mikhail Fridman', 'Артур')]
+    assert first['decision'] == 'new'
+    assert later['decision'] == 'new_planned_earlier'
+    assert later['target_uuid'] == first['target_uuid']
+    assert 'Mikhail Fridman' not in {n['name'] for n in plan['new_nodes']}
+
+
+@needs_db
+def test_a_planned_node_is_offered_only_where_its_name_is_close(db):
+    plan, llm = asyncio.run(made_plan_with_llm())
+    offered_pentagon = [
+        name for name, lists in llm.offered.items() for cands in lists if 'Пентагон' in cands
+    ]
+    assert offered_pentagon == []
+    assert any('Фридман' in cands for cands in llm.offered['Mikhail Fridman'])
