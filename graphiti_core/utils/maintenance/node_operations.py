@@ -466,24 +466,39 @@ def _commit_resolution(
     state.duplicate_pairs.extend(duplicate_pairs)
 
 
+_NAME_QUOTES = frozenset(
+    '\'"`\u00b4\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a'
+)
+_NAME_DASHES = frozenset('-\u2010\u2011\u2012\u2013\u2014\u2015\u2212')
+
+
 def _same_name(answered: str | None, name: str | None) -> bool:
     """Whether the name a dedupe answer repeats is the candidate's.
 
-    The check is whether the number and the name agree, so only letters and digits count: each
-    letter in one form (NFKC -- "й" as one code point or as "и" with a combining breve), case
-    aside, ё as е. Spacing, punctuation, quotes, hyphens and the invisible characters the client
-    strips from the prompt (``LLMClient._clean_input``) do not: a model copying a name tends to
-    change them, and the same change on every question would fail every question alike. A name
-    with no letters or digits at all is compared whole.
+    The check is whether the number and the name agree, so what tells names apart counts --
+    letters, digits and symbols such as "#", "+" and dots ("C#" is not "C++", "iOS 1.7" is not
+    "iOS 17") -- and only what a model changes while copying a name does not: the form of a
+    letter (NFKC: "й" as one code point or as "и" with a combining breve), case, ё/е, the
+    invisible characters the client strips from the prompt (``LLMClient._clean_input``),
+    quotes of any kind, and dashes and spacing, which all count as one space. A name that is
+    left with nothing is compared whole.
     """
 
-    def letters(value: str | None) -> str:
-        folded = unicodedata.normalize('NFKC', value or '').casefold().replace('ё', 'е')
-        return ''.join(char for char in folded if char.isalnum())
+    def form(value: str | None) -> str:
+        kept = []
+        for char in unicodedata.normalize('NFKC', value or ''):
+            category = unicodedata.category(char)
+            if category in ('Cf', 'Cs') or (category == 'Cc' and not char.isspace()):
+                continue
+            if char in _NAME_QUOTES:
+                continue
+            kept.append(' ' if char in _NAME_DASHES or char.isspace() else char)
+        return ' '.join(''.join(kept).casefold().replace('ё', 'е').split())
 
-    if not letters(name):
+    expected = form(name)
+    if not expected:
         return (answered or '').strip() == (name or '').strip()
-    return letters(answered) == letters(name)
+    return form(answered) == expected
 
 
 def _dedupe_reasks() -> int:
@@ -703,9 +718,10 @@ async def _resolve_with_llm(
                     continue
                 else:
                     logger.warning(
-                        'Dedupe answer for %r failed the check on every question (%d): candidate %d '
-                        'named %r is %s; treating as no duplicate.',
+                        'Dedupe answer for %r failed the check on the last question (%d of %d): '
+                        'candidate %d named %r is %s; treating as no duplicate.',
                         extracted_node.name,
+                        questions,
                         questions,
                         duplicate_candidate_id,
                         resolution.duplicate_candidate_name,
@@ -725,8 +741,10 @@ async def _resolve_with_llm(
         else:
             for i in sorted(missing_ids):
                 logger.warning(
-                    'Dedupe answer left out %r on every question (%d); treating as no duplicate.',
+                    'Dedupe answer left out %r on the last question (%d of %d); treating as no '
+                    'duplicate.',
                     extracted_nodes[originals[i]].name,
+                    questions,
                     questions,
                 )
         return sorted(set(failed))
@@ -759,7 +777,7 @@ async def _resolve_with_llm(
         messages = prompt_library.dedupe_nodes.nodes(question(again))
         try:
             answer = await ask(messages, 'dedupe_nodes.nodes_again')
-        except (TypeError, AttributeError, NameError, AssertionError):
+        except (TypeError, AttributeError, NameError, AssertionError, KeyError, IndexError):
             # These signal a bug in our own code -- the client included -- not the model.
             raise
         except Exception as error:
