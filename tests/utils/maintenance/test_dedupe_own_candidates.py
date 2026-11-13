@@ -508,14 +508,16 @@ async def test_a_programming_fault_on_a_second_question_surfaces(world, fault):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('repeated, merged', [('***', True), (' *** ', True), ('---', False)])
-async def test_a_name_with_no_letters_is_compared_whole(world, monkeypatch, repeated, merged):
-    # Without letters or digits there is nothing to compare by letters; an answer must not
-    # pass merely because it has no letters either.
-    stars = _node('***')
+@pytest.mark.parametrize(
+    'repeated, merged', [('--', True), (' -- ', True), ('', False), ('"', False), ('-', False)]
+)
+async def test_a_name_left_with_nothing_is_compared_whole(world, monkeypatch, repeated, merged):
+    # Dashes, quotes and spacing do not count, so a name made only of them is left with
+    # nothing to compare; an answer must not pass merely because it is left with nothing too.
+    dashes = _node('--')
 
     async def search(*_, **__):
-        return [[stars], [world.annie]]
+        return [[dashes], [world.annie]]
 
     monkeypatch.setattr(
         'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search', search
@@ -525,7 +527,7 @@ async def test_a_name_with_no_letters_is_compared_whole(world, monkeypatch, repe
     )
     resolved, _, _ = await _resolve(llm, world)
 
-    assert (resolved[0].uuid == stars.uuid) is merged
+    assert (resolved[0].uuid == dashes.uuid) is merged
     assert len(llm.calls) == (1 if merged else 2)
 
 
