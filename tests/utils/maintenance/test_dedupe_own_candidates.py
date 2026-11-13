@@ -312,7 +312,8 @@ async def test_an_entity_left_out_twice_is_named_in_the_log(world, caplog):
     assert resolved[1].uuid == world.ann.uuid
     assert pairs == []
     assert any(
-        'Ann' in r.getMessage() and 'every question' in r.getMessage() for r in caplog.records
+        'Ann' in r.getMessage() and 'last question (2 of 2)' in r.getMessage()
+        for r in caplog.records
     )
 
 
@@ -373,7 +374,8 @@ async def test_with_no_second_questions_a_failed_answer_keeps_no_duplicate(
     assert [n.uuid for n in resolved] == [world.joe.uuid, world.ann.uuid]
     assert pairs == []
     assert any(
-        'Joe' in r.getMessage() and 'every question' in r.getMessage() for r in caplog.records
+        'Joe' in r.getMessage() and 'last question (1 of 1)' in r.getMessage()
+        for r in caplog.records
     )
 
 
@@ -494,7 +496,9 @@ async def test_the_name_check_ignores_letter_forms_and_punctuation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('fault', [TypeError, AttributeError, NameError, AssertionError])
+@pytest.mark.parametrize(
+    'fault', [TypeError, AttributeError, NameError, AssertionError, KeyError, IndexError]
+)
 async def test_a_programming_fault_on_a_second_question_surfaces(world, fault):
     # The insurance is for the model's side; a fault that signals a bug in our own code --
     # the client included -- must not turn into "kept with no duplicate".
@@ -523,3 +527,52 @@ async def test_a_name_with_no_letters_is_compared_whole(world, monkeypatch, repe
 
     assert (resolved[0].uuid == stars.uuid) is merged
     assert len(llm.calls) == (1 if merged else 2)
+
+
+@pytest.mark.asyncio
+async def test_the_final_warning_tells_what_happened_on_the_last_question(world, caplog):
+    # Joe fails the check on the first question and is left out on the second: the warning
+    # must say he was left out on the last question, not that he failed on every one.
+    llm = ScriptedLLM([_answer((0, 'Joe', 4, 'Annie'), (1, 'Ann', -1, '')), _answer()])
+    with caplog.at_level(logging.WARNING):
+        resolved, _, _ = await _resolve(llm, world)
+
+    assert resolved[0].uuid == world.joe.uuid
+    finals = [r.getMessage() for r in caplog.records if 'last question' in r.getMessage()]
+    assert len(finals) == 1
+    assert 'Joe' in finals[0] and 'left out' in finals[0] and '(2 of 2)' in finals[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'picked, repeated',
+    [
+        ('C#', 'C++'),
+        ('C', 'C++'),
+        ('Windows 1.0', 'Windows 10'),
+        ('iOS 1.7', 'iOS 17'),
+        ('A.B.C.', 'ABC'),
+    ],
+)
+async def test_names_that_differ_in_symbols_or_dots_are_different(
+    world, monkeypatch, picked, repeated
+):
+    # The answer names one candidate and numbers another of the same entity's own: the very
+    # slip the check is for. Symbols and dots tell such names apart and must count.
+    meant, numbered = _node(repeated), _node(picked)
+
+    async def search(*_, **__):
+        return [[meant, numbered], [world.annie]]
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations._semantic_candidate_search', search
+    )
+    # Two entities: Joe's candidates are numbered 2 (meant) and 3 (numbered).
+    llm = ScriptedLLM(
+        [_answer((0, 'Joe', 3, repeated), (1, 'Ann', -1, '')), _answer((0, 'Joe', 3, repeated))]
+    )
+    resolved, _, pairs = await _resolve(llm, world)
+
+    assert len(llm.calls) == 2
+    assert resolved[0].uuid == world.joe.uuid
+    assert pairs == []
