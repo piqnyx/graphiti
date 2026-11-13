@@ -664,7 +664,6 @@ def test_plan_sends_each_entity_where_the_new_dedupe_puts_it(db):
         'Канада',
         'Пентагон',
         'Swift',
-        'Шойгу',
         'Чемезов',
         'Gmail Inc',
         'Росгвардия',
@@ -678,6 +677,7 @@ def test_plan_sends_each_entity_where_the_new_dedupe_puts_it(db):
         'Нет такого',
         'Неясно',
         'Повтор',
+        'Шойгу',
     ]
     assert [p['why'] for p in plan['problems'] if p.get('entity') == 'Повтор'] == [
         '2 episodes carry this text'
@@ -975,16 +975,13 @@ def by_fact(plan, fact):
 
 
 @needs_db
-def test_a_loop_left_by_the_old_merge_keeps_the_wrong_node_as_its_other_end(db):
+def test_a_loop_left_by_the_old_merge_is_left_whole(db):
+    # A loop E->W needs W named by the episode itself, so the old run filed W twice and wrote the
+    # fact into its summary more than once: how many lines it left is not known.
     plan, _, made, _ = asyncio.run(made_plan())
-    shoigu = by_entity(plan)[('Шойгу', 'Росатом')]['target_uuid']
-    rosatom = made['Росатом'].uuid
-    (move,) = by_fact(plan, 'Шойгу посетил Росатом')
-    assert (move['new_source'], move['new_target']) == (shoigu, rosatom)
-    edits = {e['node_uuid']: e for e in plan['summary_edits']}
-    assert edits[rosatom]['after'] == 'Госкорпорация.\nШойгу посетил Росатом'
-    new = {n['name']: n for n in plan['new_nodes']}
-    assert new['Шойгу']['summary'].count('Шойгу посетил Росатом') == 1
+    assert by_entity(plan)[('Шойгу', 'Росатом')]['decision'] == 'skipped'
+    assert not by_fact(plan, 'Шойгу посетил Росатом')
+    assert made['Росатом'].uuid not in {e['node_uuid'] for e in plan['summary_edits']}
 
 
 @needs_db
@@ -1393,3 +1390,89 @@ def test_a_summary_rewritten_without_moved_facts_says_so(db):
     plan, _, made, _ = asyncio.run(made_plan())
     edits = {e['node_uuid']: e for e in plan['summary_edits']}
     assert edits[made['Прага'].uuid]['why'] == 'summary as add_episode would write it'
+
+
+@needs_db
+def test_removing_the_last_mention_of_a_node_stops_apply(db, capsys):
+    from tools.unmerge_old_dedupe import apply, make_plan
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        # Чернобыльская АЭС keeps no mention but the one the undone merge gave it.
+        await driver.execute_query(
+            'MATCH (e:Episodic)-[m:MENTIONS]->(n:Entity {uuid: $n}) WHERE e.uuid <> $e DELETE m',
+            n=made['Чернобыльская АЭС'].uuid,
+            e=episodes['e1'].uuid,
+        )
+        one = [c for c in cases(episodes, sanctions) if c['entity'] == 'Пентагон']
+        return await make_plan(one, [GROUP], services())
+
+    plan = asyncio.run(run())
+    orphan = [p for p in plan['problems'] if 'last mention' in p['why']]
+    assert orphan and not orphan[0]['skipped']
+    copy_graph(db, GROUP, 'main_copy')
+    assert asyncio.run(apply(json.loads(json.dumps(plan)), GROUP, 'main_copy', None)) == 2
+
+
+@needs_db
+def test_a_target_summary_the_model_rewrites_says_so(db):
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        # Long enough that Graphiti no longer appends facts but asks the model for a new summary.
+        await driver.execute_query(
+            'MATCH (n:Entity {uuid: $u}) SET n.summary = $s', u=made['Яндекс'].uuid, s='x' * 1995
+        )
+        plan = await make_plan(cases(episodes, sanctions), [GROUP], services())
+        return plan, made
+
+    plan, made = asyncio.run(run())
+    edits = {e['node_uuid']: e for e in plan['summary_edits']}
+    assert edits[made['Яндекс'].uuid]['why'] == 'rewritten by the model with facts that moved here'
+
+
+@needs_db
+def test_a_target_summary_with_facts_appended_says_so(db):
+    plan, _, made, _ = asyncio.run(made_plan())
+    edits = {e['node_uuid']: e for e in plan['summary_edits']}
+    assert edits[made['Яндекс'].uuid]['why'] == 'facts that moved here, appended'
+
+
+@needs_db
+def test_a_merge_the_model_made_twice_into_one_node_with_facts_is_left_whole(db):
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        # The trace shows the answer also sent another entity into Deutsche Welle.
+        crowded = [
+            dict(c, merges_into_wrong=2) if c['entity'] == 'Канада' else c
+            for c in cases(episodes, sanctions)
+        ]
+        return await make_plan(crowded, [GROUP], services())
+
+    plan = asyncio.run(run())
+    assert by_entity(plan)[('Канада', 'Deutsche Welle')]['decision'] == 'skipped'
+
+
+@needs_db
+def test_a_moved_fact_the_target_already_has_is_shown(db):
+    from tools.unmerge_old_dedupe import make_plan, report
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        await driver.execute_query(
+            'MATCH (a:Entity {uuid: $a}), (b:Entity {uuid: $b}) '
+            "CREATE (a)-[:RELATES_TO {uuid: 'dup', fact: $f, episodes: ['x'], "
+            'source_node_uuid: $a, target_node_uuid: $b}]->(b)',
+            a=made['BBC'].uuid,
+            b=made['BBC'].uuid,
+            f='BBC News цитирует BBC',
+        )
+        return await make_plan(cases(episodes, sanctions), [GROUP], services())
+
+    plan = asyncio.run(run())
+    (move,) = by_fact(plan, 'BBC News цитирует BBC')
+    assert move['duplicates_existing'] == ['dup']
+    assert 'same fact already there' in report(plan)

@@ -570,13 +570,18 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
             for c in group_cases:
                 if not c.get('skipped'):
                     by_wrong[c['wrong_uuid']].append(c)
+            # The trace counts every merge the model's answer sent into the node (kept and unknown ones
+            # too), and an episode that named the node itself filed it once more.
             for crowd in by_wrong.values():
-                if len(crowd) > 1 and any(fact_ends.get(c['index']) for c in crowd):
+                filed_again = len(crowd) > 1 or any(
+                    c.get('merges_into_wrong', 1) > 1 or c.get('keep_mention') for c in crowd
+                )
+                if filed_again and any(fact_ends.get(c['index']) for c in crowd):
                     for c in crowd:
                         problem(
                             c,
-                            'two or more merges into one node in one episode, with facts: '
-                            'how many summary lines they left there is not known',
+                            'more than one merge into one node in one episode (the episode naming it '
+                            'counts), with facts: how many summary lines they left there is not known',
                         )
                         c['skipped'] = True
             active = [c for c in group_cases if not c.get('skipped')]
@@ -679,6 +684,19 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
             ]
             for m in moved_here:
                 m['_episode'] = episode_uuid
+                # Not merged into it: shown, so the eye sees a fact the target now holds twice.
+                m['duplicates_existing'] = [
+                    u
+                    for (u,) in rows(
+                        g,
+                        'MATCH (a:Entity {uuid: $s})-[r:RELATES_TO]->(b:Entity {uuid: $t}) '
+                        'WHERE r.uuid <> $u AND r.fact = $f RETURN r.uuid',
+                        s=m['new_source'],
+                        t=m['new_target'],
+                        u=m['uuid'],
+                        f=m['fact'],
+                    )
+                ]
             # Lines a node loses: one per end of a moved fact it no longer holds.
             for m in moved_here:
                 before, after = (
@@ -738,6 +756,21 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                         continue
                     plan['mentions_drop'].append(
                         {'uuid': m, 'graph': graph, 'episode': episode_uuid, 'entity': wrong}
+                    )
+                # The wrong node existed before this episode, so some other episode mentions it; if
+                # none does, removing this mention would leave it an orphan, and a person decides.
+                dropping = sum(1 for d in plan['mentions_drop'] if d['entity'] == wrong)
+                total = rows(
+                    g,
+                    'MATCH (:Episodic)-[m:MENTIONS]->(n:Entity {uuid: $n}) RETURN count(m)',
+                    n=wrong,
+                )[0][0]
+                if dropping and total - dropping <= 0:
+                    owner = next(c for c in changing if c['wrong_uuid'] == wrong)
+                    problem(
+                        owner,
+                        'removing the last mention of the wrong node leaves it an orphan',
+                        False,
                     )
 
             # Summaries of the targets, exactly as add_episode would have written them for this episode.
@@ -844,9 +877,14 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     'node_name': entry.get('name'),
                     'before': entry['target_before'],
                     'after': entry['target_after'],
-                    'why': 'facts that moved here'
-                    if entry.get('gained')
-                    else 'summary as add_episode would write it',
+                    'why': (
+                        'summary as add_episode would write it'
+                        if not entry.get('gained')
+                        # Graphiti appends a short summary's new facts; a long one the model rewrites.
+                        else 'facts that moved here, appended'
+                        if entry['target_after'].startswith(entry['target_before'].strip())
+                        else 'rewritten by the model with facts that moved here'
+                    ),
                 }
             )
 
@@ -905,6 +943,11 @@ def report(plan: dict) -> str:
             + (
                 f' (joined by {later} later episode{"s" if later > 1 else ""}, moved with it)'
                 if later
+                else ''
+            )
+            + (
+                f' (same fact already there: {m["duplicates_existing"]})'
+                if m.get('duplicates_existing')
                 else ''
             )
         )
