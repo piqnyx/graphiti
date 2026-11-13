@@ -141,8 +141,10 @@ def test_compare_names_a_new_orphan_entity():
 # ---------------------------------------------------------------- the graph
 
 GROUP = 'main'
-DIM = 32
+DIM = 128
 AXES: dict[str, int] = {}
+VARIANT_AXIS = DIM - 1
+CUSTOM: dict[str, list[float]] = {}
 
 
 def vector(name: str) -> list[float]:
@@ -158,12 +160,15 @@ def vector(name: str) -> list[float]:
         'Чемезов': 'Ростех',
         'Mikhail Fridman': 'Фридман',
     }
+    if name in CUSTOM:
+        return CUSTOM[name]
     key = shared.get(name, name)
-    axis = AXES.setdefault(key, len(AXES) % DIM)
+    axis = AXES.setdefault(key, len(AXES))
+    assert axis < 64, 'more names than the axes kept apart for them'
     v = [0.0] * DIM
     v[axis] = 1.0
     if name != key:
-        v[(axis + 1) % DIM] = 0.2
+        v[VARIANT_AXIS] = 0.2
     return v
 
 
@@ -649,6 +654,7 @@ def cases(episodes, sanctions):
             'episode_content': text('e19'),
             'entity_facts': [],
         },
+        {'entity': 'Зет', 'wrong': 'Артур', 'episode_content': text('e20'), 'entity_facts': []},
         {
             'entity': 'Mikhail Fridman',
             'wrong': 'Артур',
@@ -692,6 +698,7 @@ def test_plan_sends_each_entity_where_the_new_dedupe_puts_it(db):
         'Gmail Inc',
         'Росгвардия',
         'Фридман',
+        'Зет',
     }
     # Every new node carries the attributes Graphiti gave it, empty or not, for write to keep.
     assert all(isinstance(n['attributes'], dict) for n in plan['new_nodes'])
@@ -752,11 +759,14 @@ def test_plan_writes_nothing(db):
         before = snapshot(db.select_graph(GROUP), GROUP)
         from tools.unmerge_old_dedupe import make_plan
 
+        graphs = sorted(db.list_graphs())
         await make_plan(cases(episodes, sanctions), [GROUP], services())
-        return before, snapshot(db.select_graph(GROUP), GROUP)
+        return before, snapshot(db.select_graph(GROUP), GROUP), graphs
 
-    before, after = asyncio.run(run())
+    before, after, graphs = asyncio.run(run())
     assert before == after
+    # The scratch copy the plan searches is gone afterwards.
+    assert sorted(db.list_graphs()) == graphs
 
 
 def copy_graph(db, source, target):
@@ -1531,3 +1541,113 @@ def test_a_planned_node_is_offered_only_where_its_name_is_close(db):
     ]
     assert offered_pentagon == []
     assert any('Фридман' in cands for cands in llm.offered['Mikhail Fridman'])
+
+
+@needs_db
+def test_a_planned_node_is_offered_to_one_entity_not_its_whole_episode(db):
+    plan, llm = asyncio.run(made_plan_with_llm())
+    assert not any('Фридман' in cands for cands in llm.offered.get('Зет', []))
+    assert any('Фридман' in cands for cands in llm.offered['Mikhail Fridman'])
+
+
+def unit(axis: int, lean: float, base: int = 64) -> list[float]:
+    """A vector at cosine `lean` to the base axis, the rest on its own axis."""
+    v = [0.0] * DIM
+    v[base] = lean
+    v[axis] = (1 - lean * lean) ** 0.5
+    return v
+
+
+@needs_db
+def test_a_planned_node_is_offered_only_within_the_fifteen_nearest(db, monkeypatch):
+    # Real search gives an entity its fifteen nearest above the threshold: sixteen nodes nearer than
+    # the plan's node leave it out, as they would have in a run episode by episode.
+    from graphiti_core.driver.falkordb_driver import FalkorDriver
+    from graphiti_core.edges import EpisodicEdge
+    from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
+    from graphiti_core.utils.bulk_utils import add_nodes_and_edges_bulk
+    from tools.unmerge_old_dedupe import make_plan
+
+    monkeypatch.setitem(CUSTOM, 'Бета', unit(65, 1.0))
+    monkeypatch.setitem(CUSTOM, 'Альфа', unit(66, 0.5))
+    for i in range(16):
+        monkeypatch.setitem(CUSTOM, f'Ближний {i}', unit(70 + i, 0.9))
+    for i, name in enumerate(('W1', 'W2')):
+        monkeypatch.setitem(CUSTOM, name, unit(100 + i, 0.0))
+
+    async def run():
+        driver = FalkorDriver(host='127.0.0.1', port=int(PORT), database=GROUP)
+        await driver.build_indices_and_constraints()
+        emb = Embedder()
+        names = [f'Ближний {i}' for i in range(16)] + ['W1', 'W2']
+        nodes = {
+            n: EntityNode(
+                name=n,
+                group_id=GROUP,
+                labels=['Entity'],
+                summary='',
+                created_at=T0,
+                name_embedding=vector(n),
+            )
+            for n in names
+        }
+        texts = {}
+        for minutes, key, wrong in ((0, 'eA', None), (10, 'eB', 'W1'), (20, 'eC', 'W2')):
+            ep = EpisodicNode(
+                name=key,
+                group_id=GROUP,
+                labels=[],
+                source=EpisodeType.json,
+                source_description='chat',
+                content=json.dumps({'text': key}),
+                created_at=T0 + timedelta(minutes=minutes),
+                valid_at=T0 + timedelta(minutes=minutes),
+            )
+            texts[key] = ep.content
+            mentions = [nodes[n] for n in (names if wrong is None else [wrong])]
+            await add_nodes_and_edges_bulk(
+                driver,
+                [ep],
+                [
+                    EpisodicEdge(
+                        source_node_uuid=ep.uuid,
+                        target_node_uuid=n.uuid,
+                        group_id=GROUP,
+                        created_at=ep.created_at,
+                    )
+                    for n in mentions
+                ],
+                mentions if wrong is None else [],
+                [],
+                emb,
+            )
+        llm = LLM({})
+        plan = await make_plan(
+            [
+                {
+                    'entity': 'Альфа',
+                    'wrong': 'W1',
+                    'episode_content': texts['eB'],
+                    'entity_facts': [],
+                },
+                {
+                    'entity': 'Бета',
+                    'wrong': 'W2',
+                    'episode_content': texts['eC'],
+                    'entity_facts': [],
+                },
+            ],
+            [GROUP],
+            {
+                'llm': llm,
+                'embedder': Embedder(),
+                'cross_encoder': CrossEncoder(),
+                'entity_types': None,
+            },
+        )
+        return plan, llm
+
+    plan, llm = asyncio.run(run())
+    assert by_entity(plan)[('Альфа', 'W1')]['decision'] == 'new'
+    (offered,) = llm.offered['Бета']
+    assert len(offered) == 15 and 'Альфа' not in offered
