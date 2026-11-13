@@ -141,8 +141,10 @@ def test_compare_names_a_new_orphan_entity():
 # ---------------------------------------------------------------- the graph
 
 GROUP = 'main'
-DIM = 32
+DIM = 128
 AXES: dict[str, int] = {}
+VARIANT_AXIS = DIM - 1
+CUSTOM: dict[str, list[float]] = {}
 
 
 def vector(name: str) -> list[float]:
@@ -156,13 +158,17 @@ def vector(name: str) -> list[float]:
         'Brno': 'Брно',
         'ФСИН России': 'ФСИН',
         'Чемезов': 'Ростех',
+        'Mikhail Fridman': 'Фридман',
     }
+    if name in CUSTOM:
+        return CUSTOM[name]
     key = shared.get(name, name)
-    axis = AXES.setdefault(key, len(AXES) % DIM)
+    axis = AXES.setdefault(key, len(AXES))
+    assert axis < 64, 'more names than the axes kept apart for them'
     v = [0.0] * DIM
     v[axis] = 1.0
     if name != key:
-        v[(axis + 1) % DIM] = 0.2
+        v[VARIANT_AXIS] = 0.2
     return v
 
 
@@ -189,6 +195,7 @@ class LLM(LLMClient):
         super().__init__(LLMConfig(api_key='test'), cache=False)
         self.choices = choices
         self.calls = []
+        self.offered = {}
         self.summarized = []
 
     async def _generate_response(self, *args, **kwargs):
@@ -200,6 +207,9 @@ class LLM(LLMClient):
         if name.startswith('dedupe_nodes'):
             rows = []
             for e in json.loads(ENTITIES.search(messages[-1].content).group(1)):
+                self.offered.setdefault(e['name'], []).append(
+                    [c['name'] for c in e.get('candidates', [])]
+                )
                 want = self.choices.get(e['name'])
                 want, echo = want if isinstance(want, tuple) else (want, want)
                 hit = next((c for c in e.get('candidates', []) if c['name'] == want), None)
@@ -233,6 +243,7 @@ def services(choices=None):
                 'Prague': 'Прага',
                 'Brno': 'Брно',
                 'ФСИН России': 'ФСИН',
+                'Mikhail Fridman': 'Фридман',
                 # Names Ростех wrongly every time: the check fails on every question.
                 'Чемезов': ('Ростех', 'Ростех-не-тот'),
             }
@@ -369,6 +380,8 @@ async def seed():
             'Минобороны',
             'ФСИН',
             'МВД2',
+            'ReDroid',
+            'Артур',
         ],
         facts=[
             ('Чернобыльская АЭС', 'Киев', 'Чернобыльская АЭС находится рядом с Киевом'),
@@ -481,6 +494,10 @@ async def seed():
         f=guard,
         e=episodes['e5'].uuid,
     )
+    # Фридман into ReDroid, then Mikhail Fridman into Артур: in the run that had made Фридман's
+    # node by then, the second would have found it among its candidates.
+    await episode('e19', 190, 'Фридман', ['ReDroid'])
+    await episode('e20', 200, 'Mikhail Fridman', ['Артур'])
     return driver, episodes, made, sanctions
 
 
@@ -631,6 +648,19 @@ def cases(episodes, sanctions):
             'episode_content': text('e17'),
             'entity_facts': [],
         },
+        {
+            'entity': 'Фридман',
+            'wrong': 'ReDroid',
+            'episode_content': text('e19'),
+            'entity_facts': [],
+        },
+        {'entity': 'Зет', 'wrong': 'Артур', 'episode_content': text('e20'), 'entity_facts': []},
+        {
+            'entity': 'Mikhail Fridman',
+            'wrong': 'Артур',
+            'episode_content': text('e20'),
+            'entity_facts': [],
+        },
     ]
 
 
@@ -667,6 +697,8 @@ def test_plan_sends_each_entity_where_the_new_dedupe_puts_it(db):
         'Чемезов',
         'Gmail Inc',
         'Росгвардия',
+        'Фридман',
+        'Зет',
     }
     # Every new node carries the attributes Graphiti gave it, empty or not, for write to keep.
     assert all(isinstance(n['attributes'], dict) for n in plan['new_nodes'])
@@ -727,11 +759,14 @@ def test_plan_writes_nothing(db):
         before = snapshot(db.select_graph(GROUP), GROUP)
         from tools.unmerge_old_dedupe import make_plan
 
+        graphs = sorted(db.list_graphs())
         await make_plan(cases(episodes, sanctions), [GROUP], services())
-        return before, snapshot(db.select_graph(GROUP), GROUP)
+        return before, snapshot(db.select_graph(GROUP), GROUP), graphs
 
-    before, after = asyncio.run(run())
+    before, after, graphs = asyncio.run(run())
     assert before == after
+    # The scratch copy the plan searches is gone afterwards.
+    assert sorted(db.list_graphs()) == graphs
 
 
 def copy_graph(db, source, target):
@@ -1476,3 +1511,241 @@ def test_a_moved_fact_the_target_already_has_is_shown(db):
     (move,) = by_fact(plan, 'BBC News цитирует BBC')
     assert move['duplicates_existing'] == ['dup']
     assert 'same fact already there' in report(plan)
+
+
+async def made_plan_with_llm():
+    from tools.unmerge_old_dedupe import make_plan
+
+    driver, episodes, made, sanctions = await seed()
+    svc = services()
+    plan = await make_plan(cases(episodes, sanctions), [GROUP], svc)
+    return plan, svc['llm']
+
+
+@needs_db
+def test_a_node_the_plan_creates_is_a_candidate_for_later_episodes(db):
+    plan, _ = asyncio.run(made_plan_with_llm())
+    c = by_entity(plan)
+    first, later = c[('Фридман', 'ReDroid')], c[('Mikhail Fridman', 'Артур')]
+    assert first['decision'] == 'new'
+    assert later['decision'] == 'new_planned_earlier'
+    assert later['target_uuid'] == first['target_uuid']
+    assert 'Mikhail Fridman' not in {n['name'] for n in plan['new_nodes']}
+
+
+@needs_db
+def test_a_planned_node_is_offered_only_where_its_name_is_close(db):
+    plan, llm = asyncio.run(made_plan_with_llm())
+    offered_pentagon = [
+        name for name, lists in llm.offered.items() for cands in lists if 'Пентагон' in cands
+    ]
+    assert offered_pentagon == []
+    assert any('Фридман' in cands for cands in llm.offered['Mikhail Fridman'])
+
+
+@needs_db
+def test_a_planned_node_is_offered_to_one_entity_not_its_whole_episode(db):
+    plan, llm = asyncio.run(made_plan_with_llm())
+    assert not any('Фридман' in cands for cands in llm.offered.get('Зет', []))
+    assert any('Фридман' in cands for cands in llm.offered['Mikhail Fridman'])
+
+
+def unit(axis: int, lean: float, base: int = 64) -> list[float]:
+    """A vector at cosine `lean` to the base axis, the rest on its own axis."""
+    v = [0.0] * DIM
+    v[base] = lean
+    v[axis] = (1 - lean * lean) ** 0.5
+    return v
+
+
+@needs_db
+def test_a_planned_node_is_offered_only_within_the_fifteen_nearest(db, monkeypatch):
+    # Real search gives an entity its fifteen nearest above the threshold: sixteen nodes nearer than
+    # the plan's node leave it out, as they would have in a run episode by episode.
+    from graphiti_core.driver.falkordb_driver import FalkorDriver
+    from graphiti_core.edges import EpisodicEdge
+    from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
+    from graphiti_core.utils.bulk_utils import add_nodes_and_edges_bulk
+    from tools.unmerge_old_dedupe import make_plan
+
+    monkeypatch.setitem(CUSTOM, 'Бета', unit(65, 1.0))
+    monkeypatch.setitem(CUSTOM, 'Альфа', unit(66, 0.5))
+    for i in range(16):
+        monkeypatch.setitem(CUSTOM, f'Ближний {i}', unit(70 + i, 0.9))
+    for i, name in enumerate(('W1', 'W2')):
+        monkeypatch.setitem(CUSTOM, name, unit(100 + i, 0.0))
+
+    async def run():
+        driver = FalkorDriver(host='127.0.0.1', port=int(PORT), database=GROUP)
+        await driver.build_indices_and_constraints()
+        emb = Embedder()
+        names = [f'Ближний {i}' for i in range(16)] + ['W1', 'W2']
+        nodes = {
+            n: EntityNode(
+                name=n,
+                group_id=GROUP,
+                labels=['Entity'],
+                summary='',
+                created_at=T0,
+                name_embedding=vector(n),
+            )
+            for n in names
+        }
+        texts = {}
+        for minutes, key, wrong in ((0, 'eA', None), (10, 'eB', 'W1'), (20, 'eC', 'W2')):
+            ep = EpisodicNode(
+                name=key,
+                group_id=GROUP,
+                labels=[],
+                source=EpisodeType.json,
+                source_description='chat',
+                content=json.dumps({'text': key}),
+                created_at=T0 + timedelta(minutes=minutes),
+                valid_at=T0 + timedelta(minutes=minutes),
+            )
+            texts[key] = ep.content
+            mentions = [nodes[n] for n in (names if wrong is None else [wrong])]
+            await add_nodes_and_edges_bulk(
+                driver,
+                [ep],
+                [
+                    EpisodicEdge(
+                        source_node_uuid=ep.uuid,
+                        target_node_uuid=n.uuid,
+                        group_id=GROUP,
+                        created_at=ep.created_at,
+                    )
+                    for n in mentions
+                ],
+                mentions if wrong is None else [],
+                [],
+                emb,
+            )
+        llm = LLM({})
+        plan = await make_plan(
+            [
+                {
+                    'entity': 'Альфа',
+                    'wrong': 'W1',
+                    'episode_content': texts['eB'],
+                    'entity_facts': [],
+                },
+                {
+                    'entity': 'Бета',
+                    'wrong': 'W2',
+                    'episode_content': texts['eC'],
+                    'entity_facts': [],
+                },
+            ],
+            [GROUP],
+            {
+                'llm': llm,
+                'embedder': Embedder(),
+                'cross_encoder': CrossEncoder(),
+                'entity_types': None,
+            },
+        )
+        return plan, llm
+
+    plan, llm = asyncio.run(run())
+    assert by_entity(plan)[('Альфа', 'W1')]['decision'] == 'new'
+    (offered,) = llm.offered['Бета']
+    assert len(offered) == 15 and 'Альфа' not in offered
+
+
+@needs_db
+def test_preflight_takes_the_plans_own_namesakes_for_its_own(db):
+    from tools.unmerge_old_dedupe import preflight
+
+    g = db.select_graph('probe')
+    # Half a write done: two new nodes of one name the plan made are already there.
+    g.query("CREATE (:Entity {uuid: 'n1', name: 'Дубль'}), (:Entity {uuid: 'n2', name: 'Дубль'})")
+    node = {'graph': 'probe', 'name': 'Дубль', 'namesakes': []}
+    ops = {
+        'new_nodes': [dict(node, uuid='n1'), dict(node, uuid='n2')],
+        'mentions_add': [],
+        'mentions_drop': [],
+        'edge_moves': [],
+        'summary_edits': [],
+    }
+    assert preflight(g, ops) == []
+
+
+@needs_db
+def test_one_name_twice_in_one_episode_is_left_whole_after_the_first(db):
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        twice = cases(episodes, sanctions)
+        first = next(c for c in twice if c['entity'] == 'Пентагон')
+        twice.append(dict(first, entity='пентагон '))
+        return await make_plan(twice, [GROUP], services())
+
+    plan = asyncio.run(run())
+    assert [n['name'] for n in plan['new_nodes']].count('Пентагон') == 1
+    assert [p for p in plan['problems'] if p['entity'] == 'пентагон ' and p['skipped']]
+
+
+@needs_db
+def test_the_scratch_copy_is_removed_when_the_plan_fails(db, monkeypatch):
+    import tools.unmerge_old_dedupe  # noqa: F401
+    from graphiti_core.utils.maintenance import node_operations
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError('the model is gone')
+
+    monkeypatch.setattr(node_operations, 'resolve_extracted_nodes', broken)
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        await make_plan(cases(episodes, sanctions), [GROUP], services())
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(run())
+    assert not [n for n in db.list_graphs() if n.endswith('__unmerge_plan')]
+
+
+@needs_db
+def test_a_scratch_copy_already_there_stops_the_plan_unless_cleared(db):
+    from tools.unmerge_old_dedupe import make_plan
+
+    async def run(clear):
+        driver, episodes, made, sanctions = await seed()
+        db.select_graph('main__unmerge_plan').query(
+            "CREATE (:Entity {uuid: 'other', name: 'чужое'})"
+        )
+        return await make_plan(cases(episodes, sanctions), [GROUP], services(), clear_scratch=clear)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(run(False))
+    assert 'main__unmerge_plan' in db.list_graphs()
+    for name in db.list_graphs():
+        db.select_graph(name).delete()
+    plan = asyncio.run(run(True))
+    assert plan['cases'] and 'main__unmerge_plan' not in db.list_graphs()
+
+
+@needs_db
+def test_only_graphs_with_cases_are_copied(db, monkeypatch):
+    from graphiti_core.utils.maintenance import node_operations
+    from tools.unmerge_old_dedupe import make_plan
+
+    seen = []
+    real = node_operations.resolve_extracted_nodes
+
+    async def watch(*args, **kwargs):
+        seen.append(sorted(db.list_graphs()))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(node_operations, 'resolve_extracted_nodes', watch)
+
+    async def run():
+        driver, episodes, made, sanctions = await seed()
+        db.select_graph('other').query("CREATE (:Episodic {uuid: 'x', content: 'ничего общего'})")
+        return await make_plan(cases(episodes, sanctions), [GROUP, 'other'], services())
+
+    asyncio.run(run())
+    assert seen and all('other__unmerge_plan' not in graphs for graphs in seen)
+    assert all('main__unmerge_plan' in graphs for graphs in seen)

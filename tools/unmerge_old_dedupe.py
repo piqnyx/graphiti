@@ -11,10 +11,12 @@ node, appended those facts to its summary, and never created the entity itself.
 This tool puts such a merge right as if the current dedupe had made it from the
 start. Only the dedupe is repeated, with Graphiti's own functions against the
 graph as it is now: the entity goes to the twin the new dedupe finds, or becomes a
-node of its own. Extraction is not repeated -- the facts it produced were right,
+node of its own. The dedupe runs on a scratch copy of the graph where the nodes
+the plan creates appear as it goes, episode by episode, so a later entity can find
+one. Extraction is not repeated -- the facts it produced were right,
 only the node they hung on was wrong.
 
-    plan    read the graph, ask the new dedupe, write a plan file; writes nothing to the graph
+    plan    read the graph, ask the new dedupe on a scratch copy it removes after, write a plan file
     apply   carry out a plan file on one graph: a copy first, the real graph with --backup
     check   integrity counters of a graph, read only
 
@@ -72,6 +74,8 @@ PAGE = 5000
 # Graphiti appends a node's new facts to its summary through the edges it is handed; an edge whose other
 # end is this placeholder counts for one node only, which is how a gained end is handed over exactly.
 NO_NODE = '__unmerge_no_node__'
+# The plan's scratch copy of a graph is named after it with this ending, and removed when it is done.
+SCRATCH_SUFFIX = '__unmerge_plan'
 
 
 # ---------------------------------------------------------------- pure helpers
@@ -388,7 +392,9 @@ def ends(source: str, target: str) -> collections.Counter:
     return collections.Counter([source, target])
 
 
-async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) -> dict:
+async def make_plan(
+    cases: list[dict], graphs: list[str], services: Any = None, clear_scratch: bool = False
+) -> dict:
     """Read the graph and ask the current dedupe; return the plan. Writes nothing to the graph."""
     from falkordb.asyncio import FalkorDB as AsyncFalkorDB
 
@@ -398,6 +404,7 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
     from graphiti_core.nodes import EntityNode, EpisodicNode
     from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
     from graphiti_core.tracer import create_tracer
+    from graphiti_core.utils.bulk_utils import add_nodes_and_edges_bulk
     from graphiti_core.utils.maintenance.node_operations import (
         extract_attributes_from_nodes,
         resolve_extracted_nodes,
@@ -420,15 +427,6 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
             'cross_encoder': CrossEncoderFactory.create(config.llm, config.embedder),
             'entity_types': build_entity_types(config.graphiti.entity_types),
         }
-
-    # One connection for every graph. A new driver schedules an index build on its graph;
-    # marking the graphs as built keeps the plan from sending CREATE INDEX to the live base.
-    client = AsyncFalkorDB(
-        host=conn['host'], port=conn['port'], username=conn['username'], password=conn['password']
-    )
-    for name in graphs:
-        FalkorDriver._indexed_graphs.add((id(client), name))
-    drivers = {name: FalkorDriver(falkor_db=client, database=name) for name in graphs}
 
     plan: dict[str, Any] = {
         'version': PLAN_VERSION,
@@ -484,13 +482,44 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
         )
         return found[0][0] or ''
 
-    # (graph, normalized name) -> the EntityNode planned as new
+    # (graph, uuid) -> the EntityNode planned as new
     planned_new: dict[tuple[str, str], Any] = {}
     # (graph, node uuid) -> lines to remove, summaries before and after
     summaries: dict[tuple[str, str], dict] = {}
     moves: dict[str, dict] = {}  # edge uuid -> move
 
+    # The dedupe runs on a scratch copy of each graph that has cases, and the nodes this plan creates
+    # are put into it as it goes: a later episode then finds them by Graphiti's own search -- an
+    # entity's fifteen nearest above the threshold, an exact name -- as it would have in a run that
+    # went episode by episode. The graphs themselves are only read; the copies are removed at the end,
+    # however the plan ends. A copy already there may be another plan's, so it stops this one.
+    scratch = {name: f'{name}{SCRATCH_SUFFIX}' for name in sorted({g for g, _ in located})}
+    taken = [copy_name for copy_name in scratch.values() if copy_name in present]
+    if taken and not clear_scratch:
+        raise SystemExit(
+            f'scratch graphs {taken} exist: another plan may be running; '
+            'if none is, pass --clear-scratch to remove them'
+        )
+    drivers: dict[str, Any] = {}
     try:
+        for name, copy_name in scratch.items():
+            if copy_name in set(db.list_graphs()):
+                db.select_graph(copy_name).delete()
+            db.connection.execute_command('GRAPH.COPY', name, copy_name)
+        # One connection for every copy. A new driver schedules an index build on its graph; marking
+        # the copies as built keeps the plan from sending CREATE INDEX (a copy has its graph's indices).
+        client = AsyncFalkorDB(
+            host=conn['host'],
+            port=conn['port'],
+            username=conn['username'],
+            password=conn['password'],
+        )
+        for copy_name in scratch.values():
+            FalkorDriver._indexed_graphs.add((id(client), copy_name))
+        drivers = {
+            name: FalkorDriver(falkor_db=client, database=copy) for name, copy in scratch.items()
+        }
+
         for key in sorted(located, key=episode_time):
             graph, episode_uuid = key
             group_cases = located[key]
@@ -589,6 +618,17 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                             'counts), with facts: how many summary lines they left there is not known',
                         )
                         c['skipped'] = True
+            # Graphiti's extraction keeps one entity per name in an episode (lowered, spaces collapsed);
+            # a second case of the same name cannot be told apart from the first and is left whole.
+            named: set[str] = set()
+            for c in group_cases:
+                if c.get('skipped'):
+                    continue
+                exact = ' '.join(c['entity'].lower().split())
+                if exact in named:
+                    problem(c, 'the same name as another entity of this episode')
+                    c['skipped'] = True
+                named.add(exact)
             active = [c for c in group_cases if not c.get('skipped')]
             extracted = [
                 EntityNode(
@@ -608,7 +648,11 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                 node_log.addHandler(handler)
                 try:
                     resolved, _, _ = await resolve_extracted_nodes(
-                        clients, extracted, episode, previous, services['entity_types']
+                        clients,
+                        extracted,
+                        episode,
+                        previous,
+                        services['entity_types'],
                     )
                 finally:
                     node_log.removeHandler(handler)
@@ -644,14 +688,14 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     record.update(decision='same_as_before', target_uuid=t.uuid, target_name=t.name)
                     plan['cases'].append(record)
                     continue
-                if t.uuid == e.uuid:
-                    twin = planned_new.get((graph, norm(e.name)))
-                    if twin is not None:
-                        t = twin
-                        record.update(decision='new_planned_earlier')
-                    else:
-                        planned_new[(graph, norm(e.name))] = e
-                        record.update(decision='new')
+                planned = planned_new.get((graph, t.uuid))
+                if planned is not None:
+                    # The dedupe found a node this plan creates in an earlier episode.
+                    t = planned
+                    record.update(decision='new_planned_earlier')
+                elif t.uuid == e.uuid:
+                    planned_new[(graph, e.uuid)] = e
+                    record.update(decision='new')
                 else:
                     record.update(decision='existing')
                 record.update(target_uuid=t.uuid, target_name=t.name)
@@ -837,8 +881,25 @@ async def make_plan(cases: list[dict], graphs: list[str], services: Any = None) 
                     # Only a node that loses lines; one that is merely another case's target is not.
                     entry.setdefault('wrong_before', c['wrong_summary'])
                     entry['name'] = c['wrong']
+
+            # This episode's new nodes, as they stand now, go into the scratch copy for the next one.
+            made_here = [
+                t
+                for t in {t.uuid: t for t in targets.values()}.values()
+                if (graph, t.uuid) in planned_new
+            ]
+            for n in made_here:
+                if n.name_embedding is None:
+                    await n.generate_name_embedding(services['embedder'])
+            if made_here:
+                await add_nodes_and_edges_bulk(driver, [], [], made_here, [], services['embedder'])
     finally:
-        await next(iter(drivers.values())).close()
+        if drivers:
+            await next(iter(drivers.values())).close()
+        left = set(db.list_graphs())
+        for copy_name in scratch.values():
+            if copy_name in left:
+                db.select_graph(copy_name).delete()
 
     for m in moves.values():
         m.pop('_episode', None)
@@ -986,7 +1047,8 @@ def preflight(g, ops: dict) -> list[str]:
         got = rows(g, 'MATCH (n:Entity {uuid: $u}) RETURN n.name', u=n['uuid'])
         if got and got[0][0] != n['name']:
             bad.append(f'node {n["uuid"]} exists under another name')
-        others = names.get(norm(n['name']), set()) - {n['uuid']} - set(n.get('namesakes') or [])
+        planned = {m['uuid'] for m in ops['new_nodes']}
+        others = names.get(norm(n['name']), set()) - planned - set(n.get('namesakes') or [])
         if others:
             bad.append(f'a node named {n["name"]!r} appeared since the plan: {sorted(others)}')
     planned = {n['uuid'] for n in ops['new_nodes']}
@@ -1240,6 +1302,11 @@ def main(argv: list[str]) -> int:
     p.add_argument('--cases', required=True)
     p.add_argument('--out', required=True)
     p.add_argument('--graphs', nargs='+', default=['main', 'igor', 'red'])
+    p.add_argument(
+        '--clear-scratch',
+        action='store_true',
+        help='remove scratch copies a stopped plan left behind (none must be running)',
+    )
     a = sub.add_parser('apply', help='carry out a plan on one graph')
     a.add_argument('--plan', required=True)
     a.add_argument('--source', required=True, help='the graph the plan was made from, e.g. main')
@@ -1262,7 +1329,7 @@ def main(argv: list[str]) -> int:
     if args.command == 'plan':
         with open(args.cases, encoding='utf-8') as f:
             cases = json.load(f)
-        plan = asyncio.run(make_plan(cases, args.graphs))
+        plan = asyncio.run(make_plan(cases, args.graphs, clear_scratch=args.clear_scratch))
         with open(args.out, 'w', encoding='utf-8') as f:
             json.dump(plan, f, ensure_ascii=False, indent=1)
         print(report(plan))
